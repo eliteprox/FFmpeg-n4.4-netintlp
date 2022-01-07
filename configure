@@ -1872,6 +1872,7 @@ HWACCEL_LIBRARY_LIST="
     ni_logan
     opencl
     vulkan
+    libtensorflow
 "
 
 DOCUMENT_LIST="

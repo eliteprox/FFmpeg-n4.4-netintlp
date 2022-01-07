@@ -938,9 +938,9 @@ void ff_dnn_free_model_tf(DNNModel **model)
         if (tf_model->status){
             tf_model->tffns->TF_DeleteStatus(tf_model->status);
         }
-
+        
         av_freep(&tf_model->tffns);
-        TF_FREE_FUNC(tf_model->libtensorflow);
+        TF_FREE_FUNC(tf_model->libtensorflow);        
         av_freep(&tf_model);
         av_freep(model);
     }
