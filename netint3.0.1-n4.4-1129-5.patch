@@ -1,0 +1,2473 @@
+diff --git a/configure b/configure
+index d7a3f50..cff3132 100755
+--- a/configure
++++ b/configure
+@@ -289,6 +289,8 @@ External library support:
+   --enable-libwebp         enable WebP encoding via libwebp [no]
+   --enable-libx264         enable H.264 encoding via x264 [no]
+   --enable-libx265         enable HEVC encoding via x265 [no]
++  --enable-libxcoder_logan enable NetInt Xcoder [no]
++  --enable-ni_logan        enable NetInt HWaccel [no]
+   --enable-libxavs         enable AVS encoding via xavs [no]
+   --enable-libxavs2        enable AVS2 encoding via xavs2 [no]
+   --enable-libxcb          enable X11 grabbing using XCB [autodetect]
+@@ -1819,6 +1821,7 @@ EXTERNAL_LIBRARY_LIST="
+     libvorbis
+     libvpx
+     libwebp
++    libxcoder_logan
+     libxml2
+     libzimg
+     libzmq
+@@ -1867,6 +1870,7 @@ HWACCEL_LIBRARY_LIST="
+     libmfx
+     mmal
+     omx
++    ni_logan
+     opencl
+     vulkan
+ "
+@@ -2407,6 +2411,7 @@ CONFIG_EXTRA="
+     mpegvideo
+     mpegvideoenc
+     mss34dsp
++    ni
+     pixblockdsp
+     qpeldsp
+     qsv
+@@ -3291,6 +3296,10 @@ libx264_encoder_select="atsc_a53"
+ libx264rgb_encoder_deps="libx264 x264_csp_bgr"
+ libx264rgb_encoder_select="libx264_encoder"
+ libx265_encoder_deps="libx265"
++h264_ni_logan_decoder_deps="libxcoder_logan"
++h265_ni_logan_encoder_deps="libxcoder_logan"
++h265_ni_logan_decoder_deps="libxcoder_logan"
++h264_ni_logan_encoder_deps="libxcoder_logan"
+ libxavs_encoder_deps="libxavs"
+ libxavs2_encoder_deps="libxavs2"
+ libxvid_encoder_deps="libxvid"
+@@ -3619,6 +3628,7 @@ scale2ref_filter_deps="swscale"
+ scale_filter_deps="swscale"
+ scale_qsv_filter_deps="libmfx"
+ scdet_filter_select="scene_sad"
++sdl_ni_logan_filter_deps="swscale sdl2"
+ select_filter_select="scene_sad"
+ sharpness_vaapi_filter_deps="vaapi"
+ showcqt_filter_deps="avcodec avformat swscale"
+@@ -3725,7 +3735,7 @@ swscale_suggest="libm"
+ 
+ avcodec_extralibs="pthreads_extralibs iconv_extralibs dxva2_extralibs"
+ avfilter_extralibs="pthreads_extralibs"
+-avutil_extralibs="d3d11va_extralibs nanosleep_extralibs pthreads_extralibs vaapi_drm_extralibs vaapi_x11_extralibs vdpau_x11_extralibs"
++avutil_extralibs="d3d11va_extralibs nanosleep_extralibs vaapi_drm_extralibs vaapi_x11_extralibs vdpau_x11_extralibs libxcoder_logan_extralibs"
+ 
+ # programs
+ ffmpeg_deps="avcodec avfilter avformat"
+@@ -6477,6 +6487,7 @@ enabled libx264           && { check_pkg_config libx264 x264 "stdint.h x264.h" x
+                              check_cpp_condition libx262 x264.h "X264_MPEG2"
+ enabled libx265           && require_pkg_config libx265 x265 x265.h x265_api_get &&
+                              require_cpp_condition libx265 x265.h "X265_BUILD >= 70"
++enabled libxcoder_logan   && require_pkg_config libxcoder_logan xcoder_logan ni_device_api_logan.h ni_logan_device_open
+ enabled libxavs           && require libxavs "stdint.h xavs.h" xavs_encoder_encode "-lxavs $pthreads_extralibs $libm_extralibs"
+ enabled libxavs2          && require_pkg_config libxavs2 "xavs2 >= 1.3.0" "stdint.h xavs2.h" xavs2_api_get
+ enabled libxvid           && require libxvid xvid.h xvid_global -lxvidcore
+diff --git a/fftools/Makefile b/fftools/Makefile
+index 5affaa3..d71209a 100644
+--- a/fftools/Makefile
++++ b/fftools/Makefile
+@@ -11,6 +11,7 @@ ALLAVPROGS_G = $(AVBASENAMES:%=%$(PROGSSUF)_g$(EXESUF))
+ 
+ OBJS-ffmpeg                        += fftools/ffmpeg_opt.o fftools/ffmpeg_filter.o fftools/ffmpeg_hw.o
+ OBJS-ffmpeg-$(CONFIG_LIBMFX)       += fftools/ffmpeg_qsv.o
++OBJS-ffmpeg-$(CONFIG_NI_LOGAN)     += fftools/ffmpeg_ni_logan.o
+ ifndef CONFIG_VIDEOTOOLBOX
+ OBJS-ffmpeg-$(CONFIG_VDA)          += fftools/ffmpeg_videotoolbox.o
+ endif
+diff --git a/fftools/ffmpeg.c b/fftools/ffmpeg.c
+index 46bb014..8ce1a1a 100644
+--- a/fftools/ffmpeg.c
++++ b/fftools/ffmpeg.c
+@@ -1759,9 +1759,27 @@ static void print_report(int is_last_report, int64_t timer_start, int64_t cur_ti
+             float fps;
+ 
+             frame_number = ost->frame_number;
+-            fps = t > 1 ? frame_number / t : 0;
++
++            // NETINT: add option to display windowed average FPS
++            if (ni_interval_fps > 0) { // if ni_interval_fps arg selected, calculate windowed average FPS
++                float interval = (cur_time - ost->ni_prev_fps_measurement_time)/ 1000000.0 ;
++                if (interval >= (float)ni_interval_fps) { // update fps at every ni_interval_fps
++                    fps = (frame_number - ost->ni_prev_frame_count) / interval;
++                    // store variables for tracking windowed average FPS in OutputStream object
++                    ost->ni_prev_fps = fps;
++                    ost->ni_prev_fps_measurement_time = cur_time;
++                    ost->ni_prev_frame_count = frame_number;
++                } else { // display FPS from previous interval if windowing interval not yet reached
++                    fps = ost->ni_prev_fps;
++                }
++            } else { // else, use default FFmpeg default fps calculation
++                fps = t > 1 ? frame_number / t : 0;
++            }
++
++            // NETINT: add option to display windowed average FPS
++            // in addition to default behavior, display 1 decimal place in FPS if ni_interval_fps selected
+             av_bprintf(&buf, "frame=%5d fps=%3.*f q=%3.1f ",
+-                     frame_number, fps < 9.95, fps, q);
++                       frame_number, (fps < 9.95) || ni_interval_fps, fps, q);
+             av_bprintf(&buf_script, "frame=%d\n", frame_number);
+             av_bprintf(&buf_script, "fps=%.2f\n", fps);
+             av_bprintf(&buf_script, "stream_%d_%d_q=%.1f\n",
+@@ -2672,6 +2690,9 @@ static int process_input_packet(InputStream *ist, const AVPacket *pkt, int no_eo
+             ret = decode_video    (ist, repeating ? NULL : avpkt, &got_output, &duration_pts, !pkt,
+                                    &decode_failed);
+             if (!repeating || !pkt || got_output) {
++                if (got_output && repeating) { // NETINT: if a frame is already decoded no need to update DTS or PTS
++                    break;
++                }
+                 if (pkt && pkt->duration) {
+                     duration_dts = av_rescale_q(pkt->duration, ist->st->time_base, AV_TIME_BASE_Q);
+                 } else if(ist->dec_ctx->framerate.num != 0 && ist->dec_ctx->framerate.den != 0) {
+@@ -3537,6 +3558,18 @@ static int init_output_stream(OutputStream *ost, AVFrame *frame,
+         if (ret < 0)
+             return ret;
+ 
++        // NETINT: automatically enabling GenHdrs for MKV and HLS container format support
++        if (!strcmp(output_files[ost->file_index]->ctx->oformat->name, "matroska") ||
++            !strcmp(output_files[ost->file_index]->ctx->oformat->name, "hls") ||
++            !strcmp(output_files[ost->file_index]->ctx->oformat->name, "asf")) {
++            AVDictionaryEntry *t;
++            if ((t = av_dict_get(ost->encoder_opts, "xcoder-params", NULL, 0))) {
++                av_dict_set(&ost->encoder_opts, "xcoder-params", ":GenHdrs=1", AV_DICT_APPEND);
++            }else{
++                av_opt_set(ost->enc_ctx->priv_data, "xcoder-params", "GenHdrs=1", 0);
++            }
++        }
++
+         if ((ist = get_input_stream(ost)))
+             dec = ist->dec_ctx;
+         if (dec && dec->subtitle_header) {
+diff --git a/fftools/ffmpeg.h b/fftools/ffmpeg.h
+index 606f2af..06feba1 100644
+--- a/fftools/ffmpeg.h
++++ b/fftools/ffmpeg.h
+@@ -61,6 +61,7 @@ enum HWAccelID {
+     HWACCEL_GENERIC,
+     HWACCEL_VIDEOTOOLBOX,
+     HWACCEL_QSV,
++    HWACCEL_NI_LOGAN,
+ };
+ 
+ typedef struct HWAccel {
+@@ -469,6 +470,12 @@ typedef struct OutputStream {
+     AVRational mux_timebase;
+     AVRational enc_timebase;
+ 
++    // NETINT: add option to display windowed average FPS
++    int64_t ni_prev_fps_measurement_time;
++    int ni_prev_frame_count;
++    float ni_prev_fps;
++
++    int                    nb_bitstream_filters;
+     AVBSFContext            *bsf_ctx;
+ 
+     AVCodecContext *enc_ctx;
+@@ -605,6 +612,11 @@ extern float audio_drift_threshold;
+ extern float dts_delta_threshold;
+ extern float dts_error_threshold;
+ 
++// NETINT: add option to display windowed average FPS
++// if ni_interval_fps>0 the windowed average FPS calulation mode is used
++// when ni_interval_fps>0, ni_interval_fps is the window size and update interval
++extern float ni_interval_fps;
++
+ extern int audio_volume;
+ extern int audio_sync_method;
+ extern int video_sync_method;
+@@ -669,6 +681,10 @@ int ffmpeg_parse_options(int argc, char **argv);
+ int videotoolbox_init(AVCodecContext *s);
+ int qsv_init(AVCodecContext *s);
+ 
++#if CONFIG_NI_LOGAN
++int ni_logan_init(AVCodecContext *s);
++#endif
++
+ HWDevice *hw_device_get_by_name(const char *name);
+ int hw_device_init_from_string(const char *arg, HWDevice **dev);
+ void hw_device_free_all(void);
+diff --git a/fftools/ffmpeg_opt.c b/fftools/ffmpeg_opt.c
+index 807e783..b6ae4ae 100644
+--- a/fftools/ffmpeg_opt.c
++++ b/fftools/ffmpeg_opt.c
+@@ -139,6 +139,9 @@ const HWAccel hwaccels[] = {
+ #endif
+ #if CONFIG_LIBMFX
+     { "qsv",   qsv_init,   HWACCEL_QSV,   AV_PIX_FMT_QSV },
++#endif
++#if CONFIG_NI_LOGAN
++    { "ni_logan", ni_logan_init, HWACCEL_NI_LOGAN, AV_PIX_FMT_NI_LOGAN },
+ #endif
+     { 0 },
+ };
+@@ -151,6 +154,11 @@ float audio_drift_threshold = 0.1;
+ float dts_delta_threshold   = 10;
+ float dts_error_threshold   = 3600*30;
+ 
++// NETINT: add option to display windowed average FPS
++// if ni_interval_fps>0 the windowed average FPS calulation mode is used
++// when ni_interval_fps>0, ni_interval_fps is the window size and update interval
++float ni_interval_fps = 0;
++
+ int audio_volume      = 256;
+ int audio_sync_method = 0;
+ int video_sync_method = VSYNC_AUTO;
+@@ -870,7 +878,17 @@ static void add_input_streams(OptionsContext *o, AVFormatContext *ic)
+                 ist->dec = avcodec_find_decoder(par->codec_id);
+ 
+             // avformat_find_stream_info() doesn't set this for us anymore.
+-            ist->dec_ctx->framerate = st->avg_frame_rate;
++
++            // NETINT: use bitstream framerate info when find_stream_info cannot estimate it
++            if ((st->avg_frame_rate.num != 0) && (st->avg_frame_rate.den != 0)){
++                ist->dec_ctx->framerate = st->avg_frame_rate;
++            }else if ((st->r_frame_rate.num != 0) && (st->r_frame_rate.den != 0)){
++                ist->dec_ctx->framerate = st->r_frame_rate;
++            }else{
++                av_log(NULL, AV_LOG_WARNING, "No framerate info found or probed -> using a default 30 fps\n");
++                ist->dec_ctx->framerate.num = 30;
++                ist->dec_ctx->framerate.den = 1;
++            }
+ 
+             MATCH_PER_STREAM_OPT(frame_rates, str, framerate, ic, st);
+             if (framerate && av_parse_video_rate(&ist->framerate,
+@@ -1444,6 +1462,14 @@ static OutputStream *new_output_stream(OptionsContext *o, AVFormatContext *oc, e
+         exit_program(1);
+     output_streams[nb_output_streams - 1] = ost;
+ 
++    ost->autoscale = 1;
++    MATCH_PER_STREAM_OPT(autoscale, i, ost->autoscale, oc, st);
++
++    // NETINT: add option to display windowed average FPS
++    ost->ni_prev_fps_measurement_time = 0;
++    ost->ni_prev_frame_count = 0;
++    ost->ni_prev_fps = 0;
++
+     ost->file_index = nb_output_files - 1;
+     ost->index      = idx;
+     ost->st         = st;
+@@ -1572,7 +1598,8 @@ static OutputStream *new_output_stream(OptionsContext *o, AVFormatContext *oc, e
+     MATCH_PER_STREAM_OPT(disposition, str, ost->disposition, oc, st);
+     ost->disposition = av_strdup(ost->disposition);
+ 
+-    ost->max_muxing_queue_size = 128;
++    // NETINT: change max_muxing_queue_size from 128 to 512 to alleviate muxing issues due to encoding latency
++    ost->max_muxing_queue_size = 512;
+     MATCH_PER_STREAM_OPT(max_muxing_queue_size, i, ost->max_muxing_queue_size, oc, st);
+     ost->max_muxing_queue_size *= sizeof(ost->pkt);
+ 
+@@ -3542,6 +3569,8 @@ const OptionDef options[] = {
+         "timestamp discontinuity delta threshold", "threshold" },
+     { "dts_error_threshold", HAS_ARG | OPT_FLOAT | OPT_EXPERT,       { &dts_error_threshold },
+         "timestamp error delta threshold", "threshold" },
++    { "ni_interval_fps", HAS_ARG | OPT_FLOAT | OPT_EXPERT,           { &ni_interval_fps }, // NETINT: add option to display windowed average FPS
++        "window size and reporting interval for moving average processing FPS calculation", "number" },
+     { "xerror",         OPT_BOOL | OPT_EXPERT,                       { &exit_on_error },
+         "exit on error", "error" },
+     { "abort_on",       HAS_ARG | OPT_EXPERT,                        { .func_arg = opt_abort_on },
+diff --git a/libavcodec/Makefile b/libavcodec/Makefile
+index 33a280c..813bb86 100644
+--- a/libavcodec/Makefile
++++ b/libavcodec/Makefile
+@@ -17,6 +17,7 @@ HEADERS = ac3_parser.h                                                  \
+           dxva2.h                                                       \
+           jni.h                                                         \
+           mediacodec.h                                                  \
++          ni_hevc_extradata.h                                           \
+           packet.h                                                      \
+           qsv.h                                                         \
+           vaapi.h                                                       \
+@@ -49,6 +50,7 @@ OBJS = ac3_parser.o                                                     \
+        mathtables.o                                                     \
+        mediacodec.o                                                     \
+        mpeg12framerate.o                                                \
++       ni_hevc_extradata.o                                              \
+        options.o                                                        \
+        parser.o                                                         \
+        parsers.o                                                        \
+@@ -388,6 +390,10 @@ OBJS-$(CONFIG_H264_V4L2M2M_DECODER)    += v4l2_m2m_dec.o
+ OBJS-$(CONFIG_H264_V4L2M2M_ENCODER)    += v4l2_m2m_enc.o
+ OBJS-$(CONFIG_HAP_DECODER)             += hapdec.o hap.o
+ OBJS-$(CONFIG_HAP_ENCODER)             += hapenc.o hap.o
++OBJS-$(CONFIG_H264_NI_LOGAN_DECODER)   += nidec_h264_logan.o nicodec_logan.o nidec_logan.o
++OBJS-$(CONFIG_H265_NI_LOGAN_DECODER)   += nidec_hevc_logan.o nicodec_logan.o nidec_logan.o
++OBJS-$(CONFIG_H265_NI_LOGAN_ENCODER)   += nienc_hevc_logan.o nicodec_logan.o nienc_logan.o
++OBJS-$(CONFIG_H264_NI_LOGAN_ENCODER)   += nienc_h264_logan.o nicodec_logan.o nienc_logan.o
+ OBJS-$(CONFIG_HCA_DECODER)             += hcadec.o
+ OBJS-$(CONFIG_HCOM_DECODER)            += hcom.o
+ OBJS-$(CONFIG_HEVC_DECODER)            += hevcdec.o hevc_mvs.o \
+@@ -1151,8 +1157,11 @@ OBJS-$(CONFIG_H264_METADATA_BSF)          += h264_metadata_bsf.o h264_levels.o
+ OBJS-$(CONFIG_H264_MP4TOANNEXB_BSF)       += h264_mp4toannexb_bsf.o
+ OBJS-$(CONFIG_H264_REDUNDANT_PPS_BSF)     += h264_redundant_pps_bsf.o
+ OBJS-$(CONFIG_HAPQA_EXTRACT_BSF)          += hapqa_extract_bsf.o hap.o
++OBJS-$(CONFIG_HEVC_FRAME_SPLIT_BSF)       += ni_hevc_frame_split_bsf.o ni_hevc_rbsp.o
+ OBJS-$(CONFIG_HEVC_METADATA_BSF)          += h265_metadata_bsf.o h265_profile_level.o
+ OBJS-$(CONFIG_HEVC_MP4TOANNEXB_BSF)       += hevc_mp4toannexb_bsf.o
++OBJS-$(CONFIG_HEVC_RAWTOTILE_BSF)         += ni_hevc_rawtotile_bsf.o ni_hevc_rbsp.o
++OBJS-$(CONFIG_HEVC_TILE_REPACK_BSF)       += ni_hevc_tile_repack_bsf.o
+ OBJS-$(CONFIG_IMX_DUMP_HEADER_BSF)        += imx_dump_header_bsf.o
+ OBJS-$(CONFIG_MJPEG2JPEG_BSF)             += mjpeg2jpeg_bsf.o
+ OBJS-$(CONFIG_MJPEGA_DUMP_HEADER_BSF)     += mjpega_dump_header_bsf.o
+diff --git a/libavcodec/allcodecs.c b/libavcodec/allcodecs.c
+index 2e9a358..5698709 100644
+--- a/libavcodec/allcodecs.c
++++ b/libavcodec/allcodecs.c
+@@ -777,6 +777,10 @@ extern AVCodec ff_idf_decoder;
+ 
+ /* external libraries, that shouldn't be used by default if one of the
+  * above is available */
++extern AVCodec ff_h264_ni_logan_decoder;
++extern AVCodec ff_h265_ni_logan_decoder;
++extern AVCodec ff_h264_ni_logan_encoder;
++extern AVCodec ff_h265_ni_logan_encoder;
+ extern AVCodec ff_aac_mf_encoder;
+ extern AVCodec ff_ac3_mf_encoder;
+ extern AVCodec ff_h263_v4l2m2m_encoder;
+diff --git a/libavcodec/bitstream_filters.c b/libavcodec/bitstream_filters.c
+index 02d33ab..1070d99 100644
+--- a/libavcodec/bitstream_filters.c
++++ b/libavcodec/bitstream_filters.c
+@@ -38,8 +38,11 @@ extern const AVBitStreamFilter ff_h264_metadata_bsf;
+ extern const AVBitStreamFilter ff_h264_mp4toannexb_bsf;
+ extern const AVBitStreamFilter ff_h264_redundant_pps_bsf;
+ extern const AVBitStreamFilter ff_hapqa_extract_bsf;
++extern const AVBitStreamFilter ff_hevc_frame_split_bsf;
+ extern const AVBitStreamFilter ff_hevc_metadata_bsf;
+ extern const AVBitStreamFilter ff_hevc_mp4toannexb_bsf;
++extern const AVBitStreamFilter ff_hevc_rawtotile_bsf;
++extern const AVBitStreamFilter ff_hevc_tile_repack_bsf;
+ extern const AVBitStreamFilter ff_imx_dump_header_bsf;
+ extern const AVBitStreamFilter ff_mjpeg2jpeg_bsf;
+ extern const AVBitStreamFilter ff_mjpega_dump_header_bsf;
+diff --git a/libavcodec/h264_mp4toannexb_bsf.c b/libavcodec/h264_mp4toannexb_bsf.c
+index 2822644..3dc92c5 100644
+--- a/libavcodec/h264_mp4toannexb_bsf.c
++++ b/libavcodec/h264_mp4toannexb_bsf.c
+@@ -62,7 +62,8 @@ static void count_or_copy(uint8_t **out, uint64_t *out_size,
+     *out_size += start_code_size + in_size;
+ }
+ 
+-static int h264_extradata_to_annexb(AVBSFContext *ctx, const int padding)
++// NETINT: add argument side_data and side_size for sequence changing
++static int h264_extradata_to_annexb(AVBSFContext *ctx, const int padding, uint8_t *side_data, size_t side_size)	
+ {
+     H264BSFContext *s = ctx->priv_data;
+     GetByteContext ogb, *gb = &ogb;
+@@ -72,7 +73,14 @@ static int h264_extradata_to_annexb(AVBSFContext *ctx, const int padding)
+     static const uint8_t nalu_header[4] = { 0, 0, 0, 1 };
+     int length_size, pps_offset = 0;
+ 
+-    bytestream2_init(gb, ctx->par_in->extradata, ctx->par_in->extradata_size);
++    // NETINT: add processing when sidedata is available
++    if (side_data == NULL) {
++    	bytestream2_init(gb, ctx->par_in->extradata, ctx->par_in->extradata_size);
++    } else {
++        bytestream2_init(gb, side_data, side_size);
++    }
++    // End of NETINT
++
+ 
+     bytestream2_skipu(gb, 4);
+ 
+@@ -149,7 +157,7 @@ static int h264_mp4toannexb_init(AVBSFContext *ctx)
+         av_log(ctx, AV_LOG_VERBOSE,
+                "The input looks like it is Annex B already\n");
+     } else if (extra_size >= 7) {
+-        ret = h264_extradata_to_annexb(ctx, AV_INPUT_BUFFER_PADDING_SIZE);
++        ret = h264_extradata_to_annexb(ctx, AV_INPUT_BUFFER_PADDING_SIZE, NULL, 0);//NETINT: extra 2 params
+         if (ret < 0)
+             return ret;
+ 
+@@ -176,6 +184,9 @@ static int h264_mp4toannexb_filter(AVBSFContext *ctx, AVPacket *opkt)
+     uint8_t *out;
+     uint64_t out_size;
+     int ret;
++    size_t side_size = 0; // NETINT for sequence changing
++    uint8_t *side = NULL;
++
+ 
+     ret = ff_bsf_get_packet(ctx, &in);
+     if (ret < 0)
+@@ -190,6 +201,16 @@ static int h264_mp4toannexb_filter(AVBSFContext *ctx, AVPacket *opkt)
+ 
+     buf_end  = in->data + in->size;
+ 
++    // NETINT: check new extra data which maybe contains new header    
++    side = av_packet_get_side_data(in, AV_PKT_DATA_NEW_EXTRADATA, &side_size);
++    if (side) {
++        ret = h264_extradata_to_annexb(ctx, AV_INPUT_BUFFER_PADDING_SIZE, side, side_size);
++        if (ret < 0) {
++            av_log(ctx, AV_LOG_WARNING, "extra data parsing failed\n");
++        }
++    }
++    // end of NETINT
++
+ #define LOG_ONCE(...) \
+     if (j) \
+         av_log(__VA_ARGS__)
+diff --git a/libavcodec/h264_sei.c b/libavcodec/h264_sei.c
+index ca2ca59..91e8c08 100644
+--- a/libavcodec/h264_sei.c
++++ b/libavcodec/h264_sei.c
+@@ -33,6 +33,8 @@
+ #include "h264_sei.h"
+ #include "internal.h"
+ 
++#include <ni_device_api_logan.h>
++
+ #define AVERROR_PS_NOT_FOUND      FFERRTAG(0xF8,'?','P','S')
+ 
+ static const uint8_t sei_num_clock_ts_table[9] = {
+@@ -53,6 +55,7 @@ void ff_h264_sei_uninit(H264SEIContext *h)
+     h->afd.present                 =  0;
+ 
+     av_buffer_unref(&h->a53_caption.buf_ref);
++    av_buffer_unref(&h->ni_custom.buf_ref);
+     for (int i = 0; i < h->unregistered.nb_buf_ref; i++)
+         av_buffer_unref(&h->unregistered.buf_ref[i]);
+     h->unregistered.nb_buf_ref = 0;
+@@ -410,6 +413,31 @@ static int decode_alternative_transfer(H264SEIAlternativeTransfer *h,
+     return 0;
+ }
+ 
++static int decode_ni_custom(H264SEINICustom *h, GetBitContext *gb, int size)
++{
++    int i, index;
++    ni_logan_all_custom_sei_t *p_all_custom_sei;
++    ni_logan_custom_sei_t *p_custom_sei;
++
++    h->buf_ref = av_buffer_allocz(sizeof(ni_logan_all_custom_sei_t));
++    if (!h->buf_ref)
++        return AVERROR(ENOMEM);
++
++    p_all_custom_sei = (ni_logan_all_custom_sei_t *) h->buf_ref->data;
++    index = p_all_custom_sei->custom_sei_cnt;
++    p_custom_sei = &p_all_custom_sei->ni_custom_sei[index];
++
++    for (i = 0; i < size; i++)
++        p_custom_sei->custom_sei_data[i] = get_bits(gb, 8);
++
++    /* default for AVC */
++    p_custom_sei->custom_sei_loc = NI_LOGAN_CUSTOM_SEI_LOC_BEFORE_VCL;
++    p_custom_sei->custom_sei_size = size;
++    p_custom_sei->custom_sei_type = h->type;
++    p_all_custom_sei->custom_sei_cnt++;
++    return 0;
++}
++
+ int ff_h264_sei_decode(H264SEIContext *h, GetBitContext *gb,
+                        const H264ParamSets *ps, void *logctx)
+ {
+@@ -474,6 +502,10 @@ int ff_h264_sei_decode(H264SEIContext *h, GetBitContext *gb,
+         default:
+             av_log(logctx, AV_LOG_DEBUG, "unknown SEI type %d\n", type);
+         }
++
++        if (type == h->ni_custom.type) {
++            ret = decode_ni_custom(&h->ni_custom, gb, size);
++        }
+         if (ret < 0 && ret != AVERROR_PS_NOT_FOUND)
+             return ret;
+         if (ret < 0)
+diff --git a/libavcodec/h264_sei.h b/libavcodec/h264_sei.h
+index 14cc559..688d9a0 100644
+--- a/libavcodec/h264_sei.h
++++ b/libavcodec/h264_sei.h
+@@ -165,6 +165,11 @@ typedef struct H264SEIAlternativeTransfer {
+     int preferred_transfer_characteristics;
+ } H264SEIAlternativeTransfer;
+ 
++typedef struct H264SEINICustom {
++    int type;
++    AVBufferRef *buf_ref;
++} H264SEINICustom;
++
+ typedef struct H264SEIContext {
+     H264SEIPictureTiming picture_timing;
+     H264SEIAFD afd;
+@@ -176,6 +181,8 @@ typedef struct H264SEIContext {
+     H264SEIDisplayOrientation display_orientation;
+     H264SEIGreenMetaData green_metadata;
+     H264SEIAlternativeTransfer alternative_transfer;
++    // NETINT: NI AVC custom SEI
++    H264SEINICustom ni_custom;
+ } H264SEIContext;
+ 
+ struct H264ParamSets;
+diff --git a/libavcodec/h264_slice.c b/libavcodec/h264_slice.c
+index 62f7a61..bfa2025 100644
+--- a/libavcodec/h264_slice.c
++++ b/libavcodec/h264_slice.c
+@@ -448,6 +448,16 @@ int ff_h264_update_thread_context(AVCodecContext *dst,
+     }
+     h->sei.unregistered.x264_build = h1->sei.unregistered.x264_build;
+ 
++    // NETINT: custom AVC SEI
++    h->custom_sei_type       = h1->custom_sei_type;
++
++    av_buffer_unref(&h->sei.ni_custom.buf_ref);
++    if (h1->sei.ni_custom.buf_ref) {
++        h->sei.ni_custom.buf_ref = av_buffer_ref(h1->sei.ni_custom.buf_ref);
++        if (!h->sei.ni_custom.buf_ref)
++            return AVERROR(ENOMEM);
++    }
++
+     if (!h->cur_pic_ptr)
+         return 0;
+ 
+@@ -1345,6 +1355,16 @@ static int h264_export_frame_props(H264Context *h)
+         h->sei.picture_timing.timecode_cnt = 0;
+     }
+ 
++    // NETINT: custom AVC SEI
++    if (h->sei.ni_custom.buf_ref) {
++        H264SEINICustom *ni_custom = &h->sei.ni_custom;
++
++        AVFrameSideData *sd = av_frame_new_side_data_from_buf(cur->f, AV_FRAME_DATA_NETINT_CUSTOM_SEI, ni_custom->buf_ref);
++        if (!sd)
++            av_buffer_unref(&ni_custom->buf_ref);
++        ni_custom->buf_ref = NULL;
++    }
++
+     return 0;
+ }
+ 
+diff --git a/libavcodec/h264dec.c b/libavcodec/h264dec.c
+index 47b9abb..bfa6c8e 100644
+--- a/libavcodec/h264dec.c
++++ b/libavcodec/h264dec.c
+@@ -654,6 +654,7 @@ static int decode_nal_units(H264Context *h, const uint8_t *buf, int buf_size)
+             avpriv_request_sample(avctx, "data partitioning");
+             break;
+         case H264_NAL_SEI:
++            h->sei.ni_custom.type = h->custom_sei_type;
+             ret = ff_h264_sei_decode(&h->sei, &nal->gb, &h->ps, avctx);
+             h->has_recovery_point = h->has_recovery_point || h->sei.recovery_point.recovery_frame_cnt != -1;
+             if (avctx->debug & FF_DEBUG_GREEN_MD)
+@@ -1032,6 +1033,8 @@ static const AVOption h264_options[] = {
+     { "nal_length_size", "nal_length_size", OFFSET(nal_length_size), AV_OPT_TYPE_INT, {.i64 = 0}, 0, 4, 0 },
+     { "enable_er", "Enable error resilience on damaged frames (unsafe)", OFFSET(enable_er), AV_OPT_TYPE_BOOL, { .i64 = -1 }, -1, 1, VD },
+     { "x264_build", "Assume this x264 version if no x264 version found in any SEI", OFFSET(x264_build), AV_OPT_TYPE_INT, {.i64 = -1}, -1, INT_MAX, VD },
++    // NETINT: Extra h264 decoding option
++    { "custom_sei_passthru", "Specify a custom SEI type to passthrough", OFFSET(custom_sei_type), AV_OPT_TYPE_INT, {.i64 = -1}, -1, 254, VD },
+     { NULL },
+ };
+ 
+diff --git a/libavcodec/h264dec.h b/libavcodec/h264dec.h
+index b3677cd..f8e8429 100644
+--- a/libavcodec/h264dec.h
++++ b/libavcodec/h264dec.h
+@@ -551,6 +551,9 @@ typedef struct H264Context {
+ 
+     int enable_er;
+ 
++    // NETINT: option as custom SEI type setting
++    int custom_sei_type;  ///< NI custom SEI type
++
+     H264SEIContext sei;
+ 
+     AVBufferPool *qscale_table_pool;
+diff --git a/libavcodec/hevc.h b/libavcodec/hevc.h
+index 1804755..02d5d8d 100644
+--- a/libavcodec/hevc.h
++++ b/libavcodec/hevc.h
+@@ -50,6 +50,8 @@ enum HEVCNALUnitType {
+     HEVC_NAL_CRA_NUT        = 21,
+     HEVC_NAL_RSV_IRAP_VCL22 = 22,
+     HEVC_NAL_RSV_IRAP_VCL23 = 23,
++    // NETINT: duplicate old enumeration name for IRAP_VCL23
++    HEVC_NAL_IRAP_VCL23     = 23,
+     HEVC_NAL_RSV_VCL24      = 24,
+     HEVC_NAL_RSV_VCL25      = 25,
+     HEVC_NAL_RSV_VCL26      = 26,
+diff --git a/libavcodec/hevc_mp4toannexb_bsf.c b/libavcodec/hevc_mp4toannexb_bsf.c
+index ba1deb2..e05e6dd 100644
+--- a/libavcodec/hevc_mp4toannexb_bsf.c
++++ b/libavcodec/hevc_mp4toannexb_bsf.c
+@@ -37,7 +37,9 @@ typedef struct HEVCBSFContext {
+     int      extradata_parsed;
+ } HEVCBSFContext;
+ 
+-static int hevc_extradata_to_annexb(AVBSFContext *ctx)
++
++// NETINT: add argument side and side_size for sequence changing
++static int hevc_extradata_to_annexb(AVBSFContext *ctx, uint8_t *side, size_t side_size)
+ {
+     GetByteContext gb;
+     int length_size, num_arrays, i, j;
+@@ -46,7 +48,13 @@ static int hevc_extradata_to_annexb(AVBSFContext *ctx)
+     uint8_t *new_extradata = NULL;
+     size_t   new_extradata_size = 0;
+ 
+-    bytestream2_init(&gb, ctx->par_in->extradata, ctx->par_in->extradata_size);
++    // NETINT: add processing when sidedata is available 
++    if (side == NULL) {
++        bytestream2_init(&gb, ctx->par_in->extradata, ctx->par_in->extradata_size);
++    } else {
++        bytestream2_init(&gb, side, side_size);
++    }
++    // End of NETINT
+ 
+     bytestream2_skip(&gb, 21);
+     length_size = (bytestream2_get_byte(&gb) & 3) + 1;
+@@ -79,7 +87,7 @@ static int hevc_extradata_to_annexb(AVBSFContext *ctx)
+             bytestream2_get_buffer(&gb, new_extradata + new_extradata_size + 4, nalu_len);
+             new_extradata_size += 4 + nalu_len;
+             memset(new_extradata + new_extradata_size, 0, AV_INPUT_BUFFER_PADDING_SIZE);
+-        }
++	}
+     }
+ 
+     av_freep(&ctx->par_out->extradata);
+@@ -106,7 +114,7 @@ static int hevc_mp4toannexb_init(AVBSFContext *ctx)
+         av_log(ctx, AV_LOG_VERBOSE,
+                "The input looks like it is Annex B already\n");
+     } else {
+-        ret = hevc_extradata_to_annexb(ctx);
++        ret = hevc_extradata_to_annexb(ctx, NULL, 0); //NETINT: extra 2 params
+         if (ret < 0)
+             return ret;
+         s->length_size      = ret;
+@@ -124,6 +132,11 @@ static int hevc_mp4toannexb_filter(AVBSFContext *ctx, AVPacket *out)
+ 
+     int got_irap = 0;
+     int i, ret = 0;
++    // NetInt don't prepend extradata to IRAP frames if VPS/SPS/PPS already
++    // in the packet
++    int has_header = 0, has_vps = 0, has_sps = 0, has_pps = 0;
++    size_t side_size = 0; // NETINT: for sequence changing
++    uint8_t *side = NULL;
+ 
+     ret = ff_bsf_get_packet(ctx, &in);
+     if (ret < 0)
+@@ -135,6 +148,16 @@ static int hevc_mp4toannexb_filter(AVBSFContext *ctx, AVPacket *out)
+         return 0;
+     }
+ 
++    // NETINT: check new extra data which maybe contains new header    
++    side = av_packet_get_side_data(in, AV_PKT_DATA_NEW_EXTRADATA, &side_size);
++    if (side) {
++        ret = hevc_extradata_to_annexb(ctx, side, side_size);
++        if (ret < 0) {
++            av_log(ctx, AV_LOG_WARNING, "extra data parsing failed\n");
++        }
++    }
++    // end of NETINT
++
+     bytestream2_init(&gb, in->data, in->size);
+ 
+     while (bytestream2_get_bytes_left(&gb)) {
+@@ -155,10 +178,14 @@ static int hevc_mp4toannexb_filter(AVBSFContext *ctx, AVPacket *out)
+         }
+ 
+         nalu_type = (bytestream2_peek_byte(&gb) >> 1) & 0x3f;
++        has_vps |= (HEVC_NAL_VPS == nalu_type);
++        has_sps |= (HEVC_NAL_SPS == nalu_type);
++        has_pps |= (HEVC_NAL_PPS == nalu_type);
++        has_header = (has_vps && has_sps && has_pps);
+ 
+         /* prepend extradata to IRAP frames */
+         is_irap       = nalu_type >= 16 && nalu_type <= 23;
+-        add_extradata = is_irap && !got_irap;
++        add_extradata = is_irap && !has_header && !got_irap;
+         extra_size    = add_extradata * ctx->par_out->extradata_size;
+         got_irap     |= is_irap;
+ 
+diff --git a/libavcodec/hevc_sei.c b/libavcodec/hevc_sei.c
+index c881c43..a88f040 100644
+--- a/libavcodec/hevc_sei.c
++++ b/libavcodec/hevc_sei.c
+@@ -28,6 +28,8 @@
+ #include "hevc_ps.h"
+ #include "hevc_sei.h"
+ 
++#include <ni_device_api_logan.h>
++
+ static int decode_nal_sei_decoded_picture_hash(HEVCSEIPictureHash *s, GetBitContext *gb)
+ {
+     int cIdx, i;
+@@ -349,6 +351,30 @@ static int decode_nal_sei_alternative_transfer(HEVCSEIAlternativeTransfer *s, Ge
+     return 0;
+ }
+ 
++static int decode_nal_sei_ni_custom(HEVCSEINICustom *s, GetBitContext *gb, int size, int location)
++{
++    int i, index;
++    ni_logan_all_custom_sei_t *p_all_custom_sei;
++    ni_logan_custom_sei_t *p_custom_sei;
++
++    s->buf_ref = av_buffer_allocz(sizeof(ni_logan_all_custom_sei_t));
++    if (!s->buf_ref)
++        return AVERROR(ENOMEM);
++
++    p_all_custom_sei = (ni_logan_all_custom_sei_t *) s->buf_ref->data;
++    index = p_all_custom_sei->custom_sei_cnt;
++    p_custom_sei = &p_all_custom_sei->ni_custom_sei[index];
++
++    for (i = 0; i < size; i++)
++        p_custom_sei->custom_sei_data[i] = get_bits(gb, 8);
++
++    p_custom_sei->custom_sei_loc = location;
++    p_custom_sei->custom_sei_size = size;
++    p_custom_sei->custom_sei_type = s->type;
++    p_all_custom_sei->custom_sei_cnt++;
++    return 0;
++}
++
+ static int decode_nal_sei_timecode(HEVCSEITimeCode *s, GetBitContext *gb)
+ {
+     s->num_clock_ts = get_bits(gb, 2);
+@@ -465,6 +491,11 @@ static int decode_nal_sei_message(GetBitContext *gb, void *logctx, HEVCSEI *s,
+     }
+     if (get_bits_left(gb) < 8LL*payload_size)
+         return AVERROR_INVALIDDATA;
++
++    if (payload_type == s->ni_custom.type) {
++        return decode_nal_sei_ni_custom(&s->ni_custom, gb, payload_size, s->ni_custom.location);
++    }
++
+     if (nal_unit_type == HEVC_NAL_SEI_PREFIX) {
+         return decode_nal_sei_prefix(gb, logctx, s, ps, payload_type, payload_size);
+     } else { /* nal_unit_type == NAL_SEI_SUFFIX */
+@@ -493,6 +524,7 @@ int ff_hevc_decode_nal_sei(GetBitContext *gb, void *logctx, HEVCSEI *s,
+ void ff_hevc_reset_sei(HEVCSEI *s)
+ {
+     av_buffer_unref(&s->a53_caption.buf_ref);
++    av_buffer_unref(&s->ni_custom.buf_ref);
+ 
+     for (int i = 0; i < s->unregistered.nb_buf_ref; i++)
+         av_buffer_unref(&s->unregistered.buf_ref[i]);
+diff --git a/libavcodec/hevc_sei.h b/libavcodec/hevc_sei.h
+index c67dbce..26bc8e2 100644
+--- a/libavcodec/hevc_sei.h
++++ b/libavcodec/hevc_sei.h
+@@ -87,6 +87,12 @@ typedef struct HEVCSEIAlternativeTransfer {
+     int preferred_transfer_characteristics;
+ } HEVCSEIAlternativeTransfer;
+ 
++typedef struct HEVCSEINICustom {
++    AVBufferRef *buf_ref;
++    int location;
++    int type;
++} HEVCSEINICustom;
++
+ typedef struct HEVCSEITimeCode {
+     int      present;
+     uint8_t  num_clock_ts;
+@@ -120,6 +126,8 @@ typedef struct HEVCSEI {
+     int active_seq_parameter_set_id;
+     HEVCSEIAlternativeTransfer alternative_transfer;
+     HEVCSEITimeCode timecode;
++    // NETINT: NI HEVC custom SEI
++    HEVCSEINICustom ni_custom;
+ } HEVCSEI;
+ 
+ struct HEVCParamSets;
+diff --git a/libavcodec/hevcdec.c b/libavcodec/hevcdec.c
+index 2231aed..c4225b8 100644
+--- a/libavcodec/hevcdec.c
++++ b/libavcodec/hevcdec.c
+@@ -45,6 +45,8 @@
+ #include "hwconfig.h"
+ #include "profiles.h"
+ 
++#include <ni_device_api_logan.h>
++
+ const uint8_t ff_hevc_pel_weight[65] = { [2] = 0, [4] = 1, [6] = 2, [8] = 3, [12] = 4, [16] = 5, [24] = 6, [32] = 7, [48] = 8, [64] = 9 };
+ 
+ /**
+@@ -2891,6 +2893,17 @@ static int set_side_data(HEVCContext *s)
+         }
+     }
+ 
++    // NETINT: NI HEVC custom SEI
++    if (s->sei.ni_custom.buf_ref) {
++        HEVCSEINICustom *ni_custom = &s->sei.ni_custom;
++        AVFrameSideData* sd = av_frame_new_side_data_from_buf(out,
++                                                              AV_FRAME_DATA_NETINT_CUSTOM_SEI,
++                                                              ni_custom->buf_ref);
++        if (!sd)
++            av_buffer_unref(&ni_custom->buf_ref);
++        ni_custom->buf_ref = NULL;
++    }
++
+     return 0;
+ }
+ 
+@@ -3014,6 +3027,7 @@ static int decode_nal_unit(HEVCContext *s, const H2645NAL *nal)
+             if (ret < 0)
+                 goto fail;
+         }
++        s->sei.ni_custom.type = s->custom_sei_type;
+         ret = ff_hevc_decode_nal_sei(gb, s->avctx, &s->sei, &s->ps, s->nal_unit_type);
+         if (ret < 0)
+             goto fail;
+@@ -3143,6 +3157,7 @@ fail:
+ static int decode_nal_units(HEVCContext *s, const uint8_t *buf, int length)
+ {
+     int i, ret = 0;
++    int got_slice = -1;
+     int eos_at_start = 1;
+ 
+     s->ref = NULL;
+@@ -3182,6 +3197,52 @@ static int decode_nal_units(HEVCContext *s, const uint8_t *buf, int length)
+             && ff_hevc_nal_is_nonref(nal->type)) || nal->nuh_layer_id > 0)
+             continue;
+ 
++#if 1
++        switch (nal->type) {
++            case HEVC_NAL_SEI_PREFIX:
++            case HEVC_NAL_SEI_SUFFIX:
++                if (got_slice >= 0) {
++                    /* We do NOT decide SEI location according to NALU type, we
++                     * detect the actual order of NALU in AVPacket instead.
++                     */
++                    s->sei.ni_custom.location = NI_LOGAN_CUSTOM_SEI_LOC_AFTER_VCL;
++                } else {
++                    s->sei.ni_custom.location = NI_LOGAN_CUSTOM_SEI_LOC_BEFORE_VCL;
++                }
++                break;
++            case HEVC_NAL_TRAIL_R:
++            case HEVC_NAL_TRAIL_N:
++            case HEVC_NAL_TSA_N:
++            case HEVC_NAL_TSA_R:
++            case HEVC_NAL_STSA_N:
++            case HEVC_NAL_STSA_R:
++            case HEVC_NAL_BLA_W_LP:
++            case HEVC_NAL_BLA_W_RADL:
++            case HEVC_NAL_BLA_N_LP:
++            case HEVC_NAL_IDR_W_RADL:
++            case HEVC_NAL_IDR_N_LP:
++            case HEVC_NAL_CRA_NUT:
++            case HEVC_NAL_RADL_N:
++            case HEVC_NAL_RADL_R:
++            case HEVC_NAL_RASL_N:
++            case HEVC_NAL_RASL_R:
++                // For soft decoding in FFmpeg we have to assure that the non
++                // VCL slice be decoded before any VCL slice to make the custom
++                // SEI pass through. So if any VCL is found before custom SEI in
++                // the packet we need to parse the suffix SEI (even it is
++                // labeled as prefix) ahead.
++                if (i != s->pkt.nb_nals - 1) {
++                    H2645NAL *last_nal = &s->pkt.nals[s->pkt.nb_nals - 1];
++                    if (last_nal->type != nal->type) {
++                        got_slice = i;
++                        continue;
++                    }
++                }
++            default:
++                break;
++        }
++#endif
++
+         ret = decode_nal_unit(s, nal);
+         if (ret >= 0 && s->overlap > 2)
+             ret = AVERROR_INVALIDDATA;
+@@ -3192,6 +3253,20 @@ static int decode_nal_units(HEVCContext *s, const uint8_t *buf, int length)
+         }
+     }
+ 
++#if 1
++    /* We need to decode slice as the last NALU for custom SEI decoding ahead */
++    if (got_slice >= 0) {
++        ret = decode_nal_unit(s, &s->pkt.nals[got_slice]);
++        if (ret >= 0 && s->overlap > 2)
++            ret = AVERROR_INVALIDDATA;
++        if (ret < 0) {
++            av_log(s->avctx, AV_LOG_WARNING,
++                   "Error parsing NAL unit #%d.\n", i);
++            goto fail;
++        }
++    }
++#endif
++
+ fail:
+     if (s->ref && s->threads_type == FF_THREAD_FRAME)
+         ff_thread_report_progress(&s->ref->tf, INT_MAX, 0);
+@@ -3557,6 +3632,8 @@ static int hevc_update_thread_context(AVCodecContext *dst,
+     s->threads_number      = s0->threads_number;
+     s->threads_type        = s0->threads_type;
+ 
++    s->custom_sei_type     = s0->custom_sei_type;
++
+     if (s0->eos) {
+         s->seq_decode = (s->seq_decode + 1) & 0xff;
+         s->max_ra = INT_MAX;
+@@ -3594,6 +3671,7 @@ static int hevc_update_thread_context(AVCodecContext *dst,
+     s->sei.mastering_display    = s0->sei.mastering_display;
+     s->sei.content_light        = s0->sei.content_light;
+     s->sei.alternative_transfer = s0->sei.alternative_transfer;
++    s->sei.ni_custom            = s0->sei.ni_custom;
+ 
+     ret = export_stream_params_from_sei(s);
+     if (ret < 0)
+@@ -3657,6 +3735,9 @@ static const AVOption options[] = {
+         AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, PAR },
+     { "strict-displaywin", "stricly apply default display window size", OFFSET(apply_defdispwin),
+         AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, PAR },
++    // NETINT: Extra HEVC decoding option
++    { "custom_sei_passthru", "Specify the custom SEI type to passthrough", OFFSET(custom_sei_type),
++        AV_OPT_TYPE_INT, {.i64 = -1}, -1, 254, PAR },
+     { NULL },
+ };
+ 
+diff --git a/libavcodec/hevcdec.h b/libavcodec/hevcdec.h
+index 482638a..3e13e8e 100644
+--- a/libavcodec/hevcdec.h
++++ b/libavcodec/hevcdec.h
+@@ -567,6 +567,9 @@ typedef struct HEVCContext {
+     int is_nalff;           ///< this flag is != 0 if bitstream is encapsulated
+                             ///< as a format defined in 14496-15
+     int apply_defdispwin;
++    // NETINT: option as custom HEVC SEI type setting
++    int custom_sei_type;    ///< NI custom HEVC SEI type
++    int custom_sei_location;  ///< NI custom HEVC SEI location
+ 
+     int nal_length_size;    ///< Number of bytes used for nal length (1, 2 or 4)
+     int nuh_layer_id;
+diff --git a/libavcodec/packet.h b/libavcodec/packet.h
+index ca18ae6..3b8d742 100644
+--- a/libavcodec/packet.h
++++ b/libavcodec/packet.h
+@@ -290,6 +290,11 @@ enum AVPacketSideDataType {
+      */
+     AV_PKT_DATA_S12M_TIMECODE,
+ 
++    /**
++     * NETINT: HEVC tile/slice index in one frame.
++     */
++    AV_PKT_DATA_SLICE_ADDR,
++
+     /**
+      * The number of side data types.
+      * This is not part of the public API/ABI in the sense that it may
+diff --git a/libavfilter/Makefile b/libavfilter/Makefile
+index b2c254e..365527c 100644
+--- a/libavfilter/Makefile
++++ b/libavfilter/Makefile
+@@ -297,6 +297,7 @@ OBJS-$(CONFIG_HUE_FILTER)                    += vf_hue.o
+ OBJS-$(CONFIG_HWDOWNLOAD_FILTER)             += vf_hwdownload.o
+ OBJS-$(CONFIG_HWMAP_FILTER)                  += vf_hwmap.o
+ OBJS-$(CONFIG_HWUPLOAD_CUDA_FILTER)          += vf_hwupload_cuda.o
++OBJS-$(CONFIG_HWUPLOAD_NI_LOGAN_FILTER)      += vf_hwupload_ni_logan.o
+ OBJS-$(CONFIG_HWUPLOAD_FILTER)               += vf_hwupload.o
+ OBJS-$(CONFIG_HYSTERESIS_FILTER)             += vf_hysteresis.o framesync.o
+ OBJS-$(CONFIG_IDENTITY_FILTER)               += vf_identity.o
+@@ -401,6 +402,7 @@ OBJS-$(CONFIG_SCALE_VULKAN_FILTER)           += vf_scale_vulkan.o vulkan.o
+ OBJS-$(CONFIG_SCALE2REF_FILTER)              += vf_scale.o scale_eval.o
+ OBJS-$(CONFIG_SCDET_FILTER)                  += vf_scdet.o
+ OBJS-$(CONFIG_SCROLL_FILTER)                 += vf_scroll.o
++OBJS-$(CONFIG_SDL_NI_LOGAN_FILTER)           += vf_sdl_ni_logan.o
+ OBJS-$(CONFIG_SELECT_FILTER)                 += f_select.o
+ OBJS-$(CONFIG_SELECTIVECOLOR_FILTER)         += vf_selectivecolor.o
+ OBJS-$(CONFIG_SENDCMD_FILTER)                += f_sendcmd.o
+diff --git a/libavfilter/allfilters.c b/libavfilter/allfilters.c
+index 0872c6e..ab1a9fa 100644
+--- a/libavfilter/allfilters.c
++++ b/libavfilter/allfilters.c
+@@ -282,6 +282,7 @@ extern AVFilter ff_vf_hwdownload;
+ extern AVFilter ff_vf_hwmap;
+ extern AVFilter ff_vf_hwupload;
+ extern AVFilter ff_vf_hwupload_cuda;
++extern AVFilter ff_vf_hwupload_ni_logan;
+ extern AVFilter ff_vf_hysteresis;
+ extern AVFilter ff_vf_identity;
+ extern AVFilter ff_vf_idet;
+@@ -382,6 +383,7 @@ extern AVFilter ff_vf_scale_vulkan;
+ extern AVFilter ff_vf_scale2ref;
+ extern AVFilter ff_vf_scdet;
+ extern AVFilter ff_vf_scroll;
++extern AVFilter ff_vf_sdl_ni_logan;
+ extern AVFilter ff_vf_select;
+ extern AVFilter ff_vf_selectivecolor;
+ extern AVFilter ff_vf_sendcmd;
+diff --git a/libavfilter/avfilter.h b/libavfilter/avfilter.h
+index be12424..96f9306 100644
+--- a/libavfilter/avfilter.h
++++ b/libavfilter/avfilter.h
+@@ -1171,6 +1171,24 @@ char *avfilter_graph_dump(AVFilterGraph *graph, const char *options);
+  */
+ int avfilter_graph_request_oldest(AVFilterGraph *graph);
+ 
++/**
++ * compare two signature files whether those matches or not.
++ * @param signpath1        full path of the first signature file.
++ * @param signpath2        full path of the second signature file.
++ * @return  <0: error, 0: no matchiing 1: partial matching 2: whole matching.
++ */
++int avfilter_compare_sign_bypath(char *signpath1, char *signpath2);
++
++/**
++ * compare two signature buffers whether those matches or not.
++ * @param signbuf1        the pointer of the first signature buffer.
++ * @param signbuf2        the pointer of the second signature buffer.
++ * @param len1            the length of the first signature buffer.
++ * @param len2            the length of the second signature buffer.
++ * @return  <0: error, 0: no matchiing 1: partial matching 2: whole matching.
++ */
++int avfilter_compare_sign_bybuff(uint8_t *signbuf1, int len1, uint8_t *signbuf2, int len2);
++
+ /**
+  * @}
+  */
+diff --git a/libavfilter/signature_lookup.c b/libavfilter/signature_lookup.c
+index 272c717..c1e98ca 100644
+--- a/libavfilter/signature_lookup.c
++++ b/libavfilter/signature_lookup.c
+@@ -578,3 +578,194 @@ static MatchingInfo lookup_signatures(AVFilterContext *ctx, SignatureContext *sc
+     return bestmatch;
+ 
+ }
++
++
++
++static int get_block_size(const Block *b)
++{
++    return (b->to.y - b->up.y + 1) * (b->to.x - b->up.x + 1);
++}
++
++static uint64_t get_block_sum(StreamContext *sc, uint64_t intpic[32][32], const Block *b)
++{
++    uint64_t sum = 0;
++
++    int x0, y0, x1, y1;
++
++    x0 = b->up.x;
++    y0 = b->up.y;
++    x1 = b->to.x;
++    y1 = b->to.y;
++
++    if (x0-1 >= 0 && y0-1 >= 0) {
++        sum = intpic[y1][x1] + intpic[y0-1][x0-1] - intpic[y1][x0-1] - intpic[y0-1][x1];
++    } else if (x0-1 >= 0) {
++        sum = intpic[y1][x1] - intpic[y1][x0-1];
++    } else if (y0-1 >= 0) {
++        sum = intpic[y1][x1] - intpic[y0-1][x1];
++    } else {
++        sum = intpic[y1][x1];
++    }
++    return sum;
++}
++
++static int cmp(const void *x, const void *y)
++{
++    const uint64_t *a = x, *b = y;
++    return *a < *b ? -1 : ( *a > *b ? 1 : 0 );
++}
++
++/**
++ * sets the bit at position pos to 1 in data
++ */
++static void set_bit(uint8_t* data, size_t pos)
++{
++    uint8_t mask = 1 << 7-(pos%8);
++    data[pos/8] |= mask;
++}
++
++static int calc_signature(AVFilterContext *ctx, StreamContext *sc, FineSignature* fs, uint64_t intpic[32][32], int64_t denom, int64_t precfactor)
++{
++    int i, j, k, ternary;
++    uint64_t blocksum;
++    int blocksize;
++    int64_t th; /* threshold */
++    int64_t sum;
++    uint64_t conflist[DIFFELEM_SIZE];
++    int f = 0, g = 0, w = 0;
++        static const uint8_t pot3[5] = { 3*3*3*3, 3*3*3, 3*3, 3, 1 };
++    /* indexes of words : 210,217,219,274,334  44,175,233,270,273  57,70,103,237,269  100,285,295,337,354  101,102,111,275,296
++    s2usw = sorted to unsorted wordvec: 44 is at index 5, 57 at index 10...
++    */
++    static const unsigned int wordvec[25] = {44,57,70,100,101,102,103,111,175,210,217,219,233,237,269,270,273,274,275,285,295,296,334,337,354};
++    static const uint8_t      s2usw[25]   = { 5,10,11, 15, 20, 21, 12, 22,  6,  0,  1,  2,  7, 13, 14,  8,  9,  3, 23, 16, 17, 24,  4, 18, 19};
++
++    uint8_t wordt2b[5] = { 0, 0, 0, 0, 0 }; /* word ternary to binary */
++    for (i = 0; i < ELEMENT_COUNT; i++) {
++        const ElemCat* elemcat = elements[i];
++        int64_t* elemsignature;
++        uint64_t* sortsignature;
++
++        elemsignature = av_malloc_array(elemcat->elem_count, sizeof(int64_t));
++        if (!elemsignature)
++            return AVERROR(ENOMEM);
++        sortsignature = av_malloc_array(elemcat->elem_count, sizeof(int64_t));
++        if (!sortsignature) {
++            av_freep(&elemsignature);
++            return AVERROR(ENOMEM);
++        }
++
++        for (j = 0; j < elemcat->elem_count; j++) {
++            blocksum = 0;
++            blocksize = 0;
++            for (k = 0; k < elemcat->left_count; k++) {
++                blocksum += get_block_sum(sc, intpic, &elemcat->blocks[j*elemcat->block_count+k]);
++                blocksize += get_block_size(&elemcat->blocks[j*elemcat->block_count+k]);
++            }
++            sum = blocksum / blocksize;
++            if (elemcat->av_elem) {
++                sum -= 128 * precfactor * denom;
++            } else {
++                blocksum = 0;
++                blocksize = 0;
++                for (; k < elemcat->block_count; k++) {
++                    blocksum += get_block_sum(sc, intpic, &elemcat->blocks[j*elemcat->block_count+k]);
++                    blocksize += get_block_size(&elemcat->blocks[j*elemcat->block_count+k]);
++                }
++                sum -= blocksum / blocksize;
++                conflist[g++] = FFABS(sum * 8 / (precfactor * denom));
++            }
++
++            elemsignature[j] = sum;
++            sortsignature[j] = FFABS(sum);
++        }
++
++        /* get threshold */
++        qsort(sortsignature, elemcat->elem_count, sizeof(uint64_t), cmp);
++        th = sortsignature[(int) (elemcat->elem_count*0.333)];
++
++        /* ternarize */
++        for (j = 0; j < elemcat->elem_count; j++) {
++            if (elemsignature[j] < -th) {
++                ternary = 0;
++            } else if (elemsignature[j] <= th) {
++                ternary = 1;
++            } else {
++                ternary = 2;
++            }
++            fs->framesig[f/5] += ternary * pot3[f%5];
++
++            if (f == wordvec[w]) {
++                fs->words[s2usw[w]/5] += ternary * pot3[wordt2b[s2usw[w]/5]++];
++                if (w < 24)
++                    w++;
++            }
++            f++;
++        }
++        av_freep(&elemsignature);
++        av_freep(&sortsignature);
++    }
++
++    /* confidence */
++    qsort(conflist, DIFFELEM_SIZE, sizeof(uint64_t), cmp);
++    fs->confidence = FFMIN(conflist[DIFFELEM_SIZE/2], 255);
++
++    /* coarsesignature */
++    if (sc->coarsecount == 0) {
++        if (sc->curcoarsesig2) {
++            sc->curcoarsesig1 = av_mallocz(sizeof(CoarseSignature));
++            if (!sc->curcoarsesig1)
++                return AVERROR(ENOMEM);
++            sc->curcoarsesig1->first = fs;
++            sc->curcoarsesig2->next = sc->curcoarsesig1;
++            sc->coarseend = sc->curcoarsesig1;
++        }
++    }
++    if (sc->coarsecount == 45) {
++        sc->midcoarse = 1;
++        sc->curcoarsesig2 = av_mallocz(sizeof(CoarseSignature));
++        if (!sc->curcoarsesig2)
++            return AVERROR(ENOMEM);
++        sc->curcoarsesig2->first = fs;
++        sc->curcoarsesig1->next = sc->curcoarsesig2;
++        sc->coarseend = sc->curcoarsesig2;
++    }
++    for (i = 0; i < 5; i++) {
++        set_bit(sc->curcoarsesig1->data[i], fs->words[i]);
++    }
++    /* assuming the actual frame is the last */
++    sc->curcoarsesig1->last = fs;
++    if (sc->midcoarse) {
++        for (i = 0; i < 5; i++) {
++            set_bit(sc->curcoarsesig2->data[i], fs->words[i]);
++        }
++        sc->curcoarsesig2->last = fs;
++    }
++
++    sc->coarsecount = (sc->coarsecount+1)%90;
++
++    /* debug printing finesignature */
++    if (av_log_get_level() == AV_LOG_DEBUG) {
++        av_log(ctx, AV_LOG_DEBUG, "input %d, confidence: %d\n", 0, fs->confidence);
++
++        av_log(ctx, AV_LOG_DEBUG, "words:");
++        for (i = 0; i < 5; i++) {
++            av_log(ctx, AV_LOG_DEBUG, " %d:", fs->words[i] );
++            av_log(ctx, AV_LOG_DEBUG, " %d", fs->words[i] / pot3[0] );
++            for (j = 1; j < 5; j++)
++                av_log(ctx, AV_LOG_DEBUG, ",%d", fs->words[i] % pot3[j-1] / pot3[j] );
++            av_log(ctx, AV_LOG_DEBUG, ";");
++        }
++        av_log(ctx, AV_LOG_DEBUG, "\n");
++
++        av_log(ctx, AV_LOG_DEBUG, "framesignature:");
++        for (i = 0; i < SIGELEM_SIZE/5; i++) {
++            av_log(ctx, AV_LOG_DEBUG, " %d", fs->framesig[i] / pot3[0] );
++            for (j = 1; j < 5; j++)
++                av_log(ctx, AV_LOG_DEBUG, ",%d", fs->framesig[i] % pot3[j-1] / pot3[j] );
++        }
++        av_log(ctx, AV_LOG_DEBUG, "\n");
++    }
++
++    return 0;
++}
+diff --git a/libavfilter/vf_signature.c b/libavfilter/vf_signature.c
+index 32a6405..107ef2c 100644
+--- a/libavfilter/vf_signature.c
++++ b/libavfilter/vf_signature.c
+@@ -26,6 +26,7 @@
+ 
+ #include <float.h>
+ #include "libavcodec/put_bits.h"
++#include "libavcodec/get_bits.h"
+ #include "libavformat/avformat.h"
+ #include "libavutil/opt.h"
+ #include "libavutil/avstring.h"
+@@ -39,6 +40,16 @@
+ #define OFFSET(x) offsetof(SignatureContext, x)
+ #define FLAGS AV_OPT_FLAG_FILTERING_PARAM | AV_OPT_FLAG_VIDEO_PARAM
+ #define BLOCK_LCM (int64_t) 476985600
++#define INPUTS_COUNT 2
++#define MPEG7_FINESIG_NBITS 689
++
++typedef struct BoundedCoarseSignature {
++    // StartFrameOfSegment and EndFrameOfSegment
++    uint32_t firstIndex, lastIndex;
++    // StartMediaTimeOfSegment and EndMediaTimeOfSegment
++    uint64_t firstPts, lastPts;
++    CoarseSignature *cSign;
++} BoundedCoarseSignature;
+ 
+ static const AVOption signature_options[] = {
+     { "detectmode", "set the detectmode",
+@@ -104,49 +115,6 @@ static int config_input(AVFilterLink *inlink)
+     return 0;
+ }
+ 
+-static int get_block_size(const Block *b)
+-{
+-    return (b->to.y - b->up.y + 1) * (b->to.x - b->up.x + 1);
+-}
+-
+-static uint64_t get_block_sum(StreamContext *sc, uint64_t intpic[32][32], const Block *b)
+-{
+-    uint64_t sum = 0;
+-
+-    int x0, y0, x1, y1;
+-
+-    x0 = b->up.x;
+-    y0 = b->up.y;
+-    x1 = b->to.x;
+-    y1 = b->to.y;
+-
+-    if (x0-1 >= 0 && y0-1 >= 0) {
+-        sum = intpic[y1][x1] + intpic[y0-1][x0-1] - intpic[y1][x0-1] - intpic[y0-1][x1];
+-    } else if (x0-1 >= 0) {
+-        sum = intpic[y1][x1] - intpic[y1][x0-1];
+-    } else if (y0-1 >= 0) {
+-        sum = intpic[y1][x1] - intpic[y0-1][x1];
+-    } else {
+-        sum = intpic[y1][x1];
+-    }
+-    return sum;
+-}
+-
+-static int cmp(const void *x, const void *y)
+-{
+-    const uint64_t *a = x, *b = y;
+-    return *a < *b ? -1 : ( *a > *b ? 1 : 0 );
+-}
+-
+-/**
+- * sets the bit at position pos to 1 in data
+- */
+-static void set_bit(uint8_t* data, size_t pos)
+-{
+-    uint8_t mask = 1 << 7-(pos%8);
+-    data[pos/8] |= mask;
+-}
+-
+ static int filter_frame(AVFilterLink *inlink, AVFrame *picref)
+ {
+     AVFilterContext *ctx = inlink->dst;
+@@ -154,29 +122,14 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *picref)
+     StreamContext *sc = &(sic->streamcontexts[FF_INLINK_IDX(inlink)]);
+     FineSignature* fs;
+ 
+-    static const uint8_t pot3[5] = { 3*3*3*3, 3*3*3, 3*3, 3, 1 };
+-    /* indexes of words : 210,217,219,274,334  44,175,233,270,273  57,70,103,237,269  100,285,295,337,354  101,102,111,275,296
+-    s2usw = sorted to unsorted wordvec: 44 is at index 5, 57 at index 10...
+-    */
+-    static const unsigned int wordvec[25] = {44,57,70,100,101,102,103,111,175,210,217,219,233,237,269,270,273,274,275,285,295,296,334,337,354};
+-    static const uint8_t      s2usw[25]   = { 5,10,11, 15, 20, 21, 12, 22,  6,  0,  1,  2,  7, 13, 14,  8,  9,  3, 23, 16, 17, 24,  4, 18, 19};
+-
+-    uint8_t wordt2b[5] = { 0, 0, 0, 0, 0 }; /* word ternary to binary */
+     uint64_t intpic[32][32];
+     uint64_t rowcount;
+     uint8_t *p = picref->data[0];
+     int inti, intj;
+     int *intjlut;
+-
+-    uint64_t conflist[DIFFELEM_SIZE];
+-    int f = 0, g = 0, w = 0;
++    int i, j, ret;
+     int32_t dh1 = 1, dh2 = 1, dw1 = 1, dw2 = 1, a, b;
+     int64_t denom;
+-    int i, j, k, ternary;
+-    uint64_t blocksum;
+-    int blocksize;
+-    int64_t th; /* threshold */
+-    int64_t sum;
+ 
+     int64_t precfactor = (sc->divide) ? 65536 : BLOCK_LCM;
+ 
+@@ -251,133 +204,8 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *picref)
+     }
+ 
+     denom = (sc->divide) ? 1 : dh1 * dh2 * dw1 * dw2;
+-
+-    for (i = 0; i < ELEMENT_COUNT; i++) {
+-        const ElemCat* elemcat = elements[i];
+-        int64_t* elemsignature;
+-        uint64_t* sortsignature;
+-
+-        elemsignature = av_malloc_array(elemcat->elem_count, sizeof(int64_t));
+-        if (!elemsignature)
+-            return AVERROR(ENOMEM);
+-        sortsignature = av_malloc_array(elemcat->elem_count, sizeof(int64_t));
+-        if (!sortsignature) {
+-            av_freep(&elemsignature);
+-            return AVERROR(ENOMEM);
+-        }
+-
+-        for (j = 0; j < elemcat->elem_count; j++) {
+-            blocksum = 0;
+-            blocksize = 0;
+-            for (k = 0; k < elemcat->left_count; k++) {
+-                blocksum += get_block_sum(sc, intpic, &elemcat->blocks[j*elemcat->block_count+k]);
+-                blocksize += get_block_size(&elemcat->blocks[j*elemcat->block_count+k]);
+-            }
+-            sum = blocksum / blocksize;
+-            if (elemcat->av_elem) {
+-                sum -= 128 * precfactor * denom;
+-            } else {
+-                blocksum = 0;
+-                blocksize = 0;
+-                for (; k < elemcat->block_count; k++) {
+-                    blocksum += get_block_sum(sc, intpic, &elemcat->blocks[j*elemcat->block_count+k]);
+-                    blocksize += get_block_size(&elemcat->blocks[j*elemcat->block_count+k]);
+-                }
+-                sum -= blocksum / blocksize;
+-                conflist[g++] = FFABS(sum * 8 / (precfactor * denom));
+-            }
+-
+-            elemsignature[j] = sum;
+-            sortsignature[j] = FFABS(sum);
+-        }
+-
+-        /* get threshold */
+-        qsort(sortsignature, elemcat->elem_count, sizeof(uint64_t), cmp);
+-        th = sortsignature[(int) (elemcat->elem_count*0.333)];
+-
+-        /* ternarize */
+-        for (j = 0; j < elemcat->elem_count; j++) {
+-            if (elemsignature[j] < -th) {
+-                ternary = 0;
+-            } else if (elemsignature[j] <= th) {
+-                ternary = 1;
+-            } else {
+-                ternary = 2;
+-            }
+-            fs->framesig[f/5] += ternary * pot3[f%5];
+-
+-            if (f == wordvec[w]) {
+-                fs->words[s2usw[w]/5] += ternary * pot3[wordt2b[s2usw[w]/5]++];
+-                if (w < 24)
+-                    w++;
+-            }
+-            f++;
+-        }
+-        av_freep(&elemsignature);
+-        av_freep(&sortsignature);
+-    }
+-
+-    /* confidence */
+-    qsort(conflist, DIFFELEM_SIZE, sizeof(uint64_t), cmp);
+-    fs->confidence = FFMIN(conflist[DIFFELEM_SIZE/2], 255);
+-
+-    /* coarsesignature */
+-    if (sc->coarsecount == 0) {
+-        if (sc->curcoarsesig2) {
+-            sc->curcoarsesig1 = av_mallocz(sizeof(CoarseSignature));
+-            if (!sc->curcoarsesig1)
+-                return AVERROR(ENOMEM);
+-            sc->curcoarsesig1->first = fs;
+-            sc->curcoarsesig2->next = sc->curcoarsesig1;
+-            sc->coarseend = sc->curcoarsesig1;
+-        }
+-    }
+-    if (sc->coarsecount == 45) {
+-        sc->midcoarse = 1;
+-        sc->curcoarsesig2 = av_mallocz(sizeof(CoarseSignature));
+-        if (!sc->curcoarsesig2)
+-            return AVERROR(ENOMEM);
+-        sc->curcoarsesig2->first = fs;
+-        sc->curcoarsesig1->next = sc->curcoarsesig2;
+-        sc->coarseend = sc->curcoarsesig2;
+-    }
+-    for (i = 0; i < 5; i++) {
+-        set_bit(sc->curcoarsesig1->data[i], fs->words[i]);
+-    }
+-    /* assuming the actual frame is the last */
+-    sc->curcoarsesig1->last = fs;
+-    if (sc->midcoarse) {
+-        for (i = 0; i < 5; i++) {
+-            set_bit(sc->curcoarsesig2->data[i], fs->words[i]);
+-        }
+-        sc->curcoarsesig2->last = fs;
+-    }
+-
+-    sc->coarsecount = (sc->coarsecount+1)%90;
+-
+-    /* debug printing finesignature */
+-    if (av_log_get_level() == AV_LOG_DEBUG) {
+-        av_log(ctx, AV_LOG_DEBUG, "input %d, confidence: %d\n", FF_INLINK_IDX(inlink), fs->confidence);
+-
+-        av_log(ctx, AV_LOG_DEBUG, "words:");
+-        for (i = 0; i < 5; i++) {
+-            av_log(ctx, AV_LOG_DEBUG, " %d:", fs->words[i] );
+-            av_log(ctx, AV_LOG_DEBUG, " %d", fs->words[i] / pot3[0] );
+-            for (j = 1; j < 5; j++)
+-                av_log(ctx, AV_LOG_DEBUG, ",%d", fs->words[i] % pot3[j-1] / pot3[j] );
+-            av_log(ctx, AV_LOG_DEBUG, ";");
+-        }
+-        av_log(ctx, AV_LOG_DEBUG, "\n");
+-
+-        av_log(ctx, AV_LOG_DEBUG, "framesignature:");
+-        for (i = 0; i < SIGELEM_SIZE/5; i++) {
+-            av_log(ctx, AV_LOG_DEBUG, " %d", fs->framesig[i] / pot3[0] );
+-            for (j = 1; j < 5; j++)
+-                av_log(ctx, AV_LOG_DEBUG, ",%d", fs->framesig[i] % pot3[j-1] / pot3[j] );
+-        }
+-        av_log(ctx, AV_LOG_DEBUG, "\n");
+-    }
+-
++    ret = calc_signature(ctx, sc, fs, intpic, denom, precfactor);
++    if (ret < 0) return ret;
+     if (FF_INLINK_IDX(inlink) == 0)
+         return ff_filter_frame(inlink->dst->outputs[0], picref);
+     return 1;
+@@ -748,6 +576,355 @@ static int config_output(AVFilterLink *outlink)
+     return 0;
+ }
+ 
++static void release_streamcontext(StreamContext *sc)
++{
++    free(sc->coarsesiglist);
++    free(sc->finesiglist);
++}
++
++static int get_filesize(const char *filename)
++{
++    int fileLength = 0;
++    FILE *f = NULL;
++    f = fopen(filename, "rb");
++    if(f != NULL) {
++        fseek(f, 0, SEEK_END);
++        fileLength = ftell(f);
++        fclose(f);
++    }
++    return fileLength;
++}
++
++static uint8_t * get_filebuffer(const char *filename, int* fileLength)
++{
++    FILE *f = NULL;
++    unsigned int readLength, paddedLength = 0;
++    uint8_t *buffer = NULL;
++
++    //check input parameters
++    if (strlen(filename) <= 0) return buffer;
++    f = fopen(filename, "rb");
++    if (f == NULL) {
++        av_log(NULL, AV_LOG_ERROR, "Could not open the file %s\n", filename);
++        return buffer;
++    }
++    *fileLength = get_filesize(filename);
++    if(*fileLength > 0) {
++        // Cast to float is necessary to avoid int division
++        paddedLength = ceil(*fileLength / (float)AV_INPUT_BUFFER_PADDING_SIZE)*AV_INPUT_BUFFER_PADDING_SIZE + AV_INPUT_BUFFER_PADDING_SIZE;
++        buffer = (uint8_t*)av_calloc(paddedLength, sizeof(uint8_t));
++        if (!buffer) {
++            av_log(NULL, AV_LOG_ERROR, "Could not allocate memory for reading signature file\n");
++            fclose(f);
++            return NULL;
++        }
++        // Read entire file into memory
++        readLength = fread(buffer, sizeof(uint8_t), *fileLength, f);
++        if(readLength != *fileLength) {
++            av_log(NULL, AV_LOG_ERROR, "Could not read the file %s\n", filename);
++            free(buffer);
++            buffer = NULL;
++        }
++    }
++    fclose(f);
++    return buffer;
++}
++
++static int binary_import(uint8_t *buffer, int fileLength, StreamContext *sc)
++{
++    int ret = 0;
++
++    unsigned int numOfSegments = 0;
++    GetBitContext bitContext = { 0 };
++    BoundedCoarseSignature *bCs;
++    unsigned int i, j, k;
++    int totalLength = 8 * fileLength;
++    int finesigncount = 0;
++    BoundedCoarseSignature *bCoarseList;
++
++    if (init_get_bits(&bitContext, buffer, totalLength)) {
++        return -1;
++    }
++
++    // Skip the following data:
++    // - NumOfSpatial Regions: (32 bits) only 1 supported
++    // - SpatialLocationFlag: (1 bit) always the whole image
++    // - PixelX_1: (16 bits) always 0
++    // - PixelY_1: (16 bits) always 0
++    skip_bits(&bitContext, 32 + 1 + 16 * 2);
++
++    // width - 1, and height - 1
++    // PixelX_2: (16 bits) is width - 1
++    // PixelY_2: (16 bits) is height - 1
++    sc->w = get_bits(&bitContext, 16);
++    sc->h = get_bits(&bitContext, 16);
++    ++sc->w;
++    ++sc->h;
++
++    // StartFrameOfSpatialRegion, always 0
++    skip_bits(&bitContext, 32);
++
++    // NumOfFrames
++    // it's the number of fine signatures
++    sc->lastindex = get_bits_long(&bitContext, 32);
++
++    // MediaTimeUnit
++    // sc->time_base.den / sc->time_base.num
++    // hoping num is 1, other values are vague
++    // den/num might be greater than 16 bit, so cutting it
++    //put_bits(&buf, 16, 0xFFFF & (sc->time_base.den / sc->time_base.num));
++
++    sc->time_base.den = get_bits(&bitContext, 16);
++    sc->time_base.num = 1;
++
++    // Skip the following data
++    // - MediaTimeFlagOfSpatialRegion: (1 bit) always 1
++    // - StartMediaTimeOfSpatialRegion: (32 bits) always 0
++    // - EndMediaTimeOfSpatialRegion: (32 bits)
++    skip_bits(&bitContext, 1 + 32*2);
++
++    // Coarse signatures
++    // numOfSegments = number of coarse signatures
++    numOfSegments = get_bits_long(&bitContext, 32);
++    if (numOfSegments <= 0) {
++        return -1;
++    }
++
++    sc->coarsesiglist = (CoarseSignature*)av_calloc(numOfSegments, sizeof(CoarseSignature));
++    if(sc->coarsesiglist == NULL) {
++        return AVERROR(ENOMEM);
++    }
++
++    bCoarseList = (BoundedCoarseSignature*)av_calloc(numOfSegments, sizeof(BoundedCoarseSignature));
++    if(bCoarseList == NULL) {
++        av_freep(&sc->coarsesiglist);
++        return AVERROR(ENOMEM);
++    }
++
++    // CoarseSignature loading
++    for (i = 0; i < numOfSegments; ++i) {
++        bCs = &bCoarseList[i];
++        bCs->cSign = &sc->coarsesiglist[i];
++
++        if (i < numOfSegments - 1)
++            bCs->cSign->next = &sc->coarsesiglist[i + 1];
++        // each coarse signature is a VSVideoSegment
++        // StartFrameOfSegment
++        bCs->firstIndex = get_bits_long(&bitContext, 32);
++        // EndFrameOfSegment
++        bCs->lastIndex = get_bits_long(&bitContext, 32);
++
++        // MediaTimeFlagOfSegment 1 bit, always 1
++        skip_bits(&bitContext, 1);
++
++        // Fine signature pts
++        // StartMediaTimeOfSegment 32 bits
++        bCs->firstPts = get_bits_long(&bitContext, 32);
++        // EndMediaTimeOfSegment 32 bits
++        bCs->lastPts = get_bits_long(&bitContext, 32);
++        // Bag of words
++        for ( j = 0; j < 5; ++j) {
++            // read 243 bits ( = 7 * 32 + 19 = 8 * 28 + 19) into buffer
++            for ( k = 0; k < 30; ++k) {
++                // 30*8 bits = 30 bytes
++                bCs->cSign->data[j][k] = get_bits(&bitContext, 8);
++            }
++            bCs->cSign->data[j][30] = get_bits(&bitContext, 3) << 5;
++        }
++        //check remain bit
++        if(totalLength - bitContext.index <= 0) {
++            av_freep(&sc->coarsesiglist);
++            av_free(bCoarseList);
++            return -1;
++        }
++    }
++    sc->coarseend = &sc->coarsesiglist[numOfSegments - 1];
++
++    // Finesignatures
++    // CompressionFlag, only 0 supported
++    skip_bits(&bitContext, 1);
++
++
++    // Check lastindex for validity
++    finesigncount = (totalLength - bitContext.index) / MPEG7_FINESIG_NBITS;
++    if (!finesigncount) {
++        av_freep(&sc->coarsesiglist);
++        av_free(bCoarseList);
++        return -1;
++    }
++
++    if(sc->lastindex != finesigncount)
++        sc->lastindex = finesigncount;
++    sc->finesiglist = (FineSignature*)av_calloc(sc->lastindex, sizeof(FineSignature));
++    if(sc->finesiglist == NULL) {
++        av_freep(&sc->coarsesiglist);
++        av_free(bCoarseList);
++        return AVERROR(ENOMEM);
++    }
++
++    // Load fine signatures from file
++    for (i = 0; i < sc->lastindex; ++i) {
++        FineSignature *fs = &sc->finesiglist[i];
++
++        // MediaTimeFlagOfFrame always 1
++        skip_bits(&bitContext, 1);
++
++        // MediaTimeOfFrame (PTS)
++        fs->pts = get_bits_long(&bitContext, 32);
++
++        // FrameConfidence
++        fs->confidence = get_bits(&bitContext, 8);
++
++        // words
++        for (k = 0; k < 5; k++) {
++            fs->words[k] = get_bits(&bitContext, 8);
++        }
++        // framesignature
++        for (k = 0; k < SIGELEM_SIZE / 5; k++) {
++            fs->framesig[k] = get_bits(&bitContext, 8);
++        }
++    }
++
++    // Creating FineSignature linked list
++    for (i = 0; i < sc->lastindex; ++i) {
++        FineSignature *fs = &sc->finesiglist[i];
++        // Building fine signature list
++        // First element prev should be NULL
++        // Last element next should be NULL
++        if (i == 0 && sc->lastindex == 1) {
++            fs->next = NULL;
++            fs->prev = NULL;
++        } else if (i == 0) {
++            fs->next = &fs[1];
++            fs->prev = NULL;
++        }
++        else if (i == sc->lastindex - 1) {
++            fs->next = NULL;
++            fs->prev = &fs[-1];
++        }
++        else {
++            fs->next = &fs[1];
++            fs->prev = &fs[-1];
++        }
++    }
++
++    // Fine signature ranges DO overlap
++    // Assign FineSignatures to CoarseSignatures
++    for (i = 0; i < numOfSegments; ++i) {
++        BoundedCoarseSignature *bCs = &bCoarseList[i];
++        uint64_t firstpts = bCs->firstPts;
++        if (firstpts > bCs->lastPts) {
++            firstpts = bCs->lastPts;
++        }
++        for (j = 0;  j < sc->lastindex; ++j) {
++            FineSignature *fs = &sc->finesiglist[j];
++            if (fs->pts >= firstpts) {
++                // Check if the fragment's pts is inside coarse signature
++                // bounds. Upper bound is checked in for loop
++                if (!bCs->cSign->first) {
++                    bCs->cSign->first = fs;
++                }
++
++                if (bCs->cSign->last) {
++                    if (bCs->cSign->last->pts <= fs->pts)
++                        bCs->cSign->last = fs;
++                } else {
++                    bCs->cSign->last = fs;
++                }
++            }
++        }
++        if(!bCs->cSign->first || !bCs->cSign->last) {
++           ret = -1;
++           break;
++        }
++        bCs->cSign->first->index = bCs->firstIndex;
++        bCs->cSign->last->index = bCs->lastIndex;
++    }
++
++    if(ret < 0) {
++        av_freep(&sc->coarsesiglist);
++    }
++    av_free(bCoarseList);
++
++    return ret;
++}
++
++static int compare_signbuffer(uint8_t* signbuf1, int len1, uint8_t* signbuf2, int len2) {
++    int ret = -1;
++    StreamContext scontexts[INPUTS_COUNT] = { 0 };
++    MatchingInfo result = { 0 };
++    SignatureContext sigContext = {
++        .class = NULL,
++        .mode = MODE_FULL,
++        .nb_inputs = INPUTS_COUNT,
++        .filename = NULL,
++        .thworddist = 9000,
++        .thcomposdist = 60000,
++        .thl1 = 116,
++        .thdi = 0,
++        .thit = 0.5,
++        .streamcontexts = scontexts
++    };
++    if (binary_import(signbuf1, len1, &scontexts[0]) < 0 || binary_import(signbuf2, len2, &scontexts[1]) < 0) {
++        if(scontexts[0].coarsesiglist) {
++            av_freep(&scontexts[0].coarsesiglist);
++        }
++        if(scontexts[1].coarsesiglist) {
++            av_freep(&scontexts[1].coarsesiglist);
++        }
++        av_log(NULL, AV_LOG_ERROR, "Could not create StreamContext from binary data for signature\n");
++        return ret;
++    }
++    result = lookup_signatures(NULL, &sigContext, &scontexts[0], &scontexts[1], MODE_FULL);
++
++    if (result.score != 0) {
++        if (result.whole) ret = 2;//full matching
++        else ret = 1; //partial matching
++    }
++    else {
++        ret = 0; //no matching
++    }
++
++    release_streamcontext(&scontexts[0]);
++    release_streamcontext(&scontexts[1]);
++
++    return ret;
++}
++
++int avfilter_compare_sign_bybuff(uint8_t *signbuf1, int len1, uint8_t *signbuf2, int len2)
++{
++    int ret = -1;
++
++    if(signbuf1 != NULL && signbuf2 != NULL && len1 > 0 && len2 > 0) {
++        ret = compare_signbuffer(signbuf1, len1, signbuf2, len2);
++    }
++
++    return ret;
++}
++
++int avfilter_compare_sign_bypath(char *signpath1, char *signpath2)
++{
++    int ret = -1;
++
++    int len1, len2;
++    uint8_t *buffer1, *buffer2;
++    buffer1 = get_filebuffer(signpath1, &len1);
++    if(buffer1 == NULL) return AVERROR(ENOMEM);
++    buffer2 = get_filebuffer(signpath2, &len2);
++    if(buffer2 == NULL) {
++        free(buffer1);
++        return AVERROR(ENOMEM);
++    }
++    ret = compare_signbuffer(buffer1, len1, buffer2, len2);
++
++    if(buffer1 != NULL)
++        free(buffer1);
++    if(buffer2 != NULL)
++        free(buffer2);
++
++    return ret;
++}
++
+ static const AVFilterPad signature_outputs[] = {
+     {
+         .name          = "default",
+diff --git a/libavformat/flv.h b/libavformat/flv.h
+index 3571b90..91f0065 100644
+--- a/libavformat/flv.h
++++ b/libavformat/flv.h
+@@ -110,6 +110,7 @@ enum {
+     FLV_CODECID_H264    = 7,
+     FLV_CODECID_REALH263= 8,
+     FLV_CODECID_MPEG4   = 9,
++    FLV_CODECID_HEVC    = 12,
+ };
+ 
+ enum {
+diff --git a/libavformat/flvdec.c b/libavformat/flvdec.c
+index 79c810f..117a99e 100644
+--- a/libavformat/flvdec.c
++++ b/libavformat/flvdec.c
+@@ -36,6 +36,7 @@
+ #include "internal.h"
+ #include "avio_internal.h"
+ #include "flv.h"
++#include "hevc.h"
+ 
+ #define VALIDATE_INDEX_TS_THRESH 2500
+ 
+@@ -320,6 +321,8 @@ static int flv_same_video_codec(AVCodecParameters *vpar, int flags)
+         return vpar->codec_id == AV_CODEC_ID_VP6A;
+     case FLV_CODECID_H264:
+         return vpar->codec_id == AV_CODEC_ID_H264;
++    case FLV_CODECID_HEVC:
++        return vpar->codec_id == AV_CODEC_ID_HEVC;
+     default:
+         return vpar->codec_tag == flv_codecid;
+     }
+@@ -365,6 +368,11 @@ static int flv_set_video_codec(AVFormatContext *s, AVStream *vstream,
+         vstream->need_parsing = AVSTREAM_PARSE_HEADERS;
+         ret = 3;     // not 4, reading packet type will consume one byte
+         break;
++    case FLV_CODECID_HEVC:
++        par->codec_id = AV_CODEC_ID_HEVC;
++        vstream->need_parsing = AVSTREAM_PARSE_NONE;
++        ret = 3;     // not 4, reading packet type will consume one byte
++        break;
+     case FLV_CODECID_MPEG4:
+         par->codec_id = AV_CODEC_ID_MPEG4;
+         ret = 3;
+@@ -1241,7 +1249,8 @@ retry_duration:
+ 
+     if (st->codecpar->codec_id == AV_CODEC_ID_AAC ||
+         st->codecpar->codec_id == AV_CODEC_ID_H264 ||
+-        st->codecpar->codec_id == AV_CODEC_ID_MPEG4) {
++        st->codecpar->codec_id == AV_CODEC_ID_MPEG4 ||
++        st->codecpar->codec_id == AV_CODEC_ID_HEVC) {
+         int type = avio_r8(s->pb);
+         size--;
+ 
+@@ -1250,7 +1259,8 @@ retry_duration:
+             goto leave;
+         }
+ 
+-        if (st->codecpar->codec_id == AV_CODEC_ID_H264 || st->codecpar->codec_id == AV_CODEC_ID_MPEG4) {
++        if (st->codecpar->codec_id == AV_CODEC_ID_H264 || st->codecpar->codec_id == AV_CODEC_ID_MPEG4 ||
++            st->codecpar->codec_id == AV_CODEC_ID_HEVC) {
+             // sign extension
+             int32_t cts = (avio_rb24(s->pb) + 0xff800000) ^ 0xff800000;
+             pts = av_sat_add64(dts, cts);
+@@ -1266,7 +1276,7 @@ retry_duration:
+             }
+         }
+         if (type == 0 && (!st->codecpar->extradata || st->codecpar->codec_id == AV_CODEC_ID_AAC ||
+-            st->codecpar->codec_id == AV_CODEC_ID_H264)) {
++            st->codecpar->codec_id == AV_CODEC_ID_H264 || st->codecpar->codec_id == AV_CODEC_ID_HEVC)) {
+             AVDictionaryEntry *t;
+ 
+             if (st->codecpar->extradata) {
+diff --git a/libavformat/flvenc.c b/libavformat/flvenc.c
+index 35bf7ac..045849a 100644
+--- a/libavformat/flvenc.c
++++ b/libavformat/flvenc.c
+@@ -34,6 +34,7 @@
+ #include "libavutil/opt.h"
+ #include "libavcodec/put_bits.h"
+ #include "libavcodec/aacenctab.h"
++#include "hevc.h"
+ 
+ 
+ static const AVCodecTag flv_video_codec_ids[] = {
+@@ -46,6 +47,7 @@ static const AVCodecTag flv_video_codec_ids[] = {
+     { AV_CODEC_ID_VP6,      FLV_CODECID_VP6 },
+     { AV_CODEC_ID_VP6A,     FLV_CODECID_VP6A },
+     { AV_CODEC_ID_H264,     FLV_CODECID_H264 },
++    { AV_CODEC_ID_HEVC,     FLV_CODECID_HEVC },
+     { AV_CODEC_ID_NONE,     0 }
+ };
+ 
+@@ -236,13 +238,15 @@ static void put_timestamp(AVIOContext *pb, int64_t ts) {
+     avio_w8(pb, (ts >> 24) & 0x7F);
+ }
+ 
+-static void put_avc_eos_tag(AVIOContext *pb, unsigned ts)
++// NETINT: add 'id' param
++static void put_avc_eos_tag(AVIOContext *pb, unsigned ts, enum AVCodecID id)
+ {
+     avio_w8(pb, FLV_TAG_TYPE_VIDEO);
+     avio_wb24(pb, 5);               /* Tag Data Size */
+     put_timestamp(pb, ts);
+     avio_wb24(pb, 0);               /* StreamId = 0 */
+-    avio_w8(pb, 23);                /* ub[4] FrameType = 1, ub[4] CodecId = 7 */
++    // NETINT: 44(0x2C) for HEVC
++    avio_w8(pb, (id==AV_CODEC_ID_H264)? 23:44);   /* ub[4] FrameType = 1, ub[4] CodecId = 7 */
+     avio_w8(pb, 2);                 /* AVC end of sequence */
+     avio_wb24(pb, 0);               /* Always 0 for AVC EOS. */
+     avio_wb32(pb, 16);              /* Size of FLV tag */
+@@ -490,8 +494,13 @@ static void flv_write_codec_header(AVFormatContext* s, AVCodecParameters* par, i
+     AVIOContext *pb = s->pb;
+     FLVContext *flv = s->priv_data;
+ 
++    // NETINT: do not attempt to write FLV headers if they are not available
++    if ((par->codec_id == AV_CODEC_ID_H264 || par->codec_id == AV_CODEC_ID_HEVC) &&
++        ! (par->extradata && par->extradata_size > 0))
++        return;
++
+     if (par->codec_id == AV_CODEC_ID_AAC || par->codec_id == AV_CODEC_ID_H264
+-            || par->codec_id == AV_CODEC_ID_MPEG4) {
++            || par->codec_id == AV_CODEC_ID_MPEG4 || par->codec_id == AV_CODEC_ID_HEVC) {
+         int64_t pos;
+         avio_w8(pb,
+                 par->codec_type == AVMEDIA_TYPE_VIDEO ?
+@@ -537,7 +546,11 @@ static void flv_write_codec_header(AVFormatContext* s, AVCodecParameters* par, i
+             avio_w8(pb, par->codec_tag | FLV_FRAME_KEY); // flags
+             avio_w8(pb, 0); // AVC sequence header
+             avio_wb24(pb, 0); // composition time
+-            ff_isom_write_avcc(pb, par->extradata, par->extradata_size);
++            if (par->codec_id == AV_CODEC_ID_HEVC) {
++                ff_isom_write_hvcc(pb, par->extradata, par->extradata_size, 0);
++            } else {
++                ff_isom_write_avcc(pb, par->extradata, par->extradata_size);
++            }
+         }
+         data_size = avio_tell(pb) - pos;
+         avio_seek(pb, -data_size - 10, SEEK_CUR);
+@@ -844,8 +857,8 @@ end:
+             AVCodecParameters *par = s->streams[i]->codecpar;
+             FLVStreamContext *sc = s->streams[i]->priv_data;
+             if (par->codec_type == AVMEDIA_TYPE_VIDEO &&
+-                    (par->codec_id == AV_CODEC_ID_H264 || par->codec_id == AV_CODEC_ID_MPEG4))
+-                put_avc_eos_tag(pb, sc->last_ts);
++                    (par->codec_id == AV_CODEC_ID_H264 || par->codec_id == AV_CODEC_ID_MPEG4 || par->codec_id == AV_CODEC_ID_HEVC))
++                put_avc_eos_tag(pb, sc->last_ts, par->codec_id); // NETINT: add codec_id 
+         }
+     }
+ 
+@@ -895,13 +908,13 @@ static int flv_write_packet(AVFormatContext *s, AVPacket *pkt)
+     if (par->codec_id == AV_CODEC_ID_VP6F || par->codec_id == AV_CODEC_ID_VP6A ||
+         par->codec_id == AV_CODEC_ID_VP6  || par->codec_id == AV_CODEC_ID_AAC)
+         flags_size = 2;
+-    else if (par->codec_id == AV_CODEC_ID_H264 || par->codec_id == AV_CODEC_ID_MPEG4)
++    else if (par->codec_id == AV_CODEC_ID_H264 || par->codec_id == AV_CODEC_ID_MPEG4 || par->codec_id == AV_CODEC_ID_HEVC)
+         flags_size = 5;
+     else
+         flags_size = 1;
+ 
+     if (par->codec_id == AV_CODEC_ID_AAC || par->codec_id == AV_CODEC_ID_H264
+-            || par->codec_id == AV_CODEC_ID_MPEG4) {
++            || par->codec_id == AV_CODEC_ID_MPEG4 || par->codec_id == AV_CODEC_ID_HEVC) {
+         buffer_size_t side_size;
+         uint8_t *side = av_packet_get_side_data(pkt, AV_PKT_DATA_NEW_EXTRADATA, &side_size);
+         if (side && side_size > 0 && (side_size != par->extradata_size || memcmp(side, par->extradata, side_size))) {
+@@ -966,6 +979,10 @@ static int flv_write_packet(AVFormatContext *s, AVPacket *pkt)
+         if (par->extradata_size > 0 && *(uint8_t*)par->extradata != 1)
+             if ((ret = ff_avc_parse_nal_units_buf(pkt->data, &data, &size)) < 0)
+                 return ret;
++    } else if (par->codec_id == AV_CODEC_ID_HEVC) {
++        if (par->extradata_size > 0 && *(uint8_t*)par->extradata != 1)
++            if ((ret = ff_hevc_annexb2mp4_buf(pkt->data, &data, &size, 0, NULL)) < 0)
++                return ret;
+     } else if (par->codec_id == AV_CODEC_ID_AAC && pkt->size > 2 &&
+                (AV_RB16(pkt->data) & 0xfff0) == 0xfff0) {
+         if (!s->streams[pkt->stream_index]->nb_frames) {
+@@ -1038,7 +1055,7 @@ static int flv_write_packet(AVFormatContext *s, AVPacket *pkt)
+                              (FFALIGN(par->height, 16) - par->height));
+         } else if (par->codec_id == AV_CODEC_ID_AAC)
+             avio_w8(pb, 1); // AAC raw
+-        else if (par->codec_id == AV_CODEC_ID_H264 || par->codec_id == AV_CODEC_ID_MPEG4) {
++        else if (par->codec_id == AV_CODEC_ID_H264 || par->codec_id == AV_CODEC_ID_MPEG4 || par->codec_id == AV_CODEC_ID_HEVC) {
+             avio_w8(pb, 1); // AVC NALU
+             avio_wb24(pb, pkt->pts - pkt->dts);
+         }
+diff --git a/libavformat/movenc.c b/libavformat/movenc.c
+index bade57d..e773982 100644
+--- a/libavformat/movenc.c
++++ b/libavformat/movenc.c
+@@ -5913,7 +5913,9 @@ static int mov_write_single_packet(AVFormatContext *s, AVPacket *pkt)
+     if (trk->par->codec_id == AV_CODEC_ID_MP4ALS ||
+             trk->par->codec_id == AV_CODEC_ID_AAC ||
+             trk->par->codec_id == AV_CODEC_ID_AV1 ||
+-            trk->par->codec_id == AV_CODEC_ID_FLAC) {
++            trk->par->codec_id == AV_CODEC_ID_FLAC ||
++            trk->par->codec_id == AV_CODEC_ID_HEVC ||
++            trk->par->codec_id == AV_CODEC_ID_H264) {
+         buffer_size_t side_size;
+         uint8_t *side = av_packet_get_side_data(pkt, AV_PKT_DATA_NEW_EXTRADATA, &side_size);
+         if (side && side_size > 0 && (side_size != par->extradata_size || memcmp(side, par->extradata, side_size))) {
+@@ -7182,8 +7184,8 @@ static const AVCodecTag codec_mp4_tags[] = {
+     { AV_CODEC_ID_MPEG4,           MKTAG('m', 'p', '4', 'v') },
+     { AV_CODEC_ID_H264,            MKTAG('a', 'v', 'c', '1') },
+     { AV_CODEC_ID_H264,            MKTAG('a', 'v', 'c', '3') },
+-    { AV_CODEC_ID_HEVC,            MKTAG('h', 'e', 'v', '1') },
+     { AV_CODEC_ID_HEVC,            MKTAG('h', 'v', 'c', '1') },
++    { AV_CODEC_ID_HEVC,            MKTAG('h', 'e', 'v', '1') },
+     { AV_CODEC_ID_MPEG2VIDEO,      MKTAG('m', 'p', '4', 'v') },
+     { AV_CODEC_ID_MPEG1VIDEO,      MKTAG('m', 'p', '4', 'v') },
+     { AV_CODEC_ID_MJPEG,           MKTAG('m', 'p', '4', 'v') },
+diff --git a/libavformat/mpegenc.c b/libavformat/mpegenc.c
+index d37f181..5567a36 100644
+--- a/libavformat/mpegenc.c
++++ b/libavformat/mpegenc.c
+@@ -423,7 +423,7 @@ static av_cold int mpeg_mux_init(AVFormatContext *ctx)
+ 
+             /* This value HAS to be used for VCD (see VCD standard, p. IV-7).
+              * Right now it is also used for everything else. */
+-            stream->max_buffer_size = 4 * 1024;
++            stream->max_buffer_size = 4 * 1024 * 2; // NETINT: Increase MPG buffers to avoid overflow at higher bitrates
+             s->audio_bound++;
+             break;
+         case AVMEDIA_TYPE_VIDEO:
+@@ -434,14 +434,14 @@ static av_cold int mpeg_mux_init(AVFormatContext *ctx)
+ 
+             props = (AVCPBProperties*)av_stream_get_side_data(st, AV_PKT_DATA_CPB_PROPERTIES, NULL);
+             if (props && props->buffer_size)
+-                stream->max_buffer_size = 6 * 1024 + props->buffer_size / 8;
++                stream->max_buffer_size = (6 * 1024 + props->buffer_size / 8) * 2; // NETINT: Increase MPG buffers to avoid overflow at higher bitrates
+             else {
+                 av_log(ctx, AV_LOG_WARNING,
+                        "VBV buffer size not set, using default size of 230KB\n"
+                        "If you want the mpeg file to be compliant to some specification\n"
+                        "Like DVD, VCD or others, make sure you set the correct buffer size\n");
+                 // FIXME: this is probably too small as default
+-                stream->max_buffer_size = 230 * 1024;
++                stream->max_buffer_size = 230 * 1024 * 2; // NETINT: Increase MPG buffers to avoid overflow at higher bitrates
+             }
+             if (stream->max_buffer_size > 1024 * 8191) {
+                 av_log(ctx, AV_LOG_WARNING, "buffer size %d, too large\n", stream->max_buffer_size);
+diff --git a/libavformat/mpegts.h b/libavformat/mpegts.h
+index 04874e0..734f977 100644
+--- a/libavformat/mpegts.h
++++ b/libavformat/mpegts.h
+@@ -135,6 +135,7 @@
+ #define STREAM_TYPE_AUDIO_AC3       0x81
+ #define STREAM_TYPE_AUDIO_DTS       0x82
+ #define STREAM_TYPE_AUDIO_TRUEHD    0x83
++#define STREAM_TYPE_SCTE_35         0x86 // NETINT: add scte35 type to mpegts muxer as PSI
+ #define STREAM_TYPE_AUDIO_EAC3      0x87
+ 
+ /* ISO/IEC 13818-1 Table 2-22 */
+diff --git a/libavformat/mpegtsenc.c b/libavformat/mpegtsenc.c
+index 35c835c..d5b3502 100644
+--- a/libavformat/mpegtsenc.c
++++ b/libavformat/mpegtsenc.c
+@@ -76,6 +76,7 @@ typedef struct MpegTSWrite {
+     const AVClass *av_class;
+     MpegTSSection pat; /* MPEG-2 PAT table */
+     MpegTSSection sdt; /* MPEG-2 SDT table context */
++    MpegTSSection scte35; /* MPEG-2 scte35 signaling */ // NETINT: add scte35 type to mpegts muxer as PSI
+     MpegTSService **services;
+     AVPacket *pkt;
+     int64_t sdt_period; /* SDT period in PCR time base */
+@@ -115,6 +116,12 @@ typedef struct MpegTSWrite {
+     int64_t last_pat_ts;
+     int64_t last_sdt_ts;
+ 
++    // NETINT: add scte35 type to mpegts muxer as PSI
++    int64_t last_scte35_ts;
++    int64_t scte35_period_us;
++    int scte35_packet_count;
++    int64_t scte35_period;
++
+     int omit_video_pes_length;
+ } MpegTSWrite;
+ 
+@@ -217,6 +224,24 @@ static int mpegts_write_section1(MpegTSSection *s, int tid, int id,
+     return 0;
+ }
+ 
++// NETINT: add scte35 type to mpegts muxer as PSI
++static int mpegts_write_section_scte35(MpegTSSection *s, uint8_t *buf, int len)
++{
++    uint8_t section[1024], *q;
++    unsigned int tot_len;
++
++    tot_len = len;
++    /* check if not too big */
++    if (tot_len > 1024)
++        return AVERROR_INVALIDDATA;
++
++    q    = section;
++    memcpy(q, buf, len);
++
++    mpegts_write_section(s, section, tot_len);
++    return 0;
++}
++
+ /*********************************************/
+ /* mpegts writer */
+ 
+@@ -355,6 +380,10 @@ static int get_dvb_stream_type(AVFormatContext *s, AVStream *st)
+     case AV_CODEC_ID_TIMED_ID3:
+         stream_type = STREAM_TYPE_METADATA;
+         break;
++	// NETINT: add scte35 type to mpegts muxer as PSI
++    case AV_CODEC_ID_SCTE_35:
++        stream_type = STREAM_TYPE_SCTE_35;
++        break;
+     case AV_CODEC_ID_DVB_SUBTITLE:
+     case AV_CODEC_ID_DVB_TELETEXT:
+         stream_type = STREAM_TYPE_PRIVATE_DATA;
+@@ -442,6 +471,20 @@ static int mpegts_write_pmt(AVFormatContext *s, MpegTSService *service)
+     q += 2; /* patched after */
+ 
+     /* put program info here */
++	// NETINT: add scte35 type to mpegts muxer as PSI
++    for (i = 0; i < s->nb_streams; i++) {
++        if(s->streams[i]->codecpar->codec_id==AV_CODEC_ID_SCTE_35){
++            *q++ = 0x05; // ANSI SCTE35 descriptor tag
++            *q++ = 0x04; // ANSI SCTE35 descriptor length (4 for CUEI)
++
++            *q++ = 0x43; // 'C'
++            *q++ = 0x55; // 'U'
++            *q++ = 0x45; // 'E'
++            *q++ = 0x49; // 'I'
++            break;
++        }
++    }
++
+     if (ts->m2ts_mode) {
+         put_registration_descriptor(&q, MKTAG('H', 'D', 'M', 'V'));
+         *q++ = 0x88;        // descriptor_tag - hdmv_copy_control_descriptor
+@@ -797,6 +840,38 @@ static void mpegts_write_sdt(AVFormatContext *s)
+                           data, q - data);
+ }
+ 
++// NETINT: add scte35 type to mpegts muxer as PSI
++static void mpegts_write_scte35(AVFormatContext *s, int64_t pts, const uint8_t *payload, int payload_size)
++{
++    MpegTSWrite *ts = s->priv_data;
++    uint8_t payloadSynced[SECTION_LENGTH];
++    uint8_t data[SECTION_LENGTH], *q;
++    if(payload_size > SECTION_LENGTH){
++      av_log(s, AV_LOG_ERROR, "SCTE35 Payload exceeds max section length \n");
++      return;
++    }
++    q = data;
++    memcpy(payloadSynced, payload, payload_size);
++
++    // set ffmpeg pts
++    if (payloadSynced[13] == 6){ // scte 35 time signal type = 6
++        payloadSynced[15] = (pts & 0xFF000000) >> 24;
++        payloadSynced[16] = (pts & 0x00FF0000) >> 16;
++        payloadSynced[17] = (pts & 0x0000FF00) >> 8;
++        payloadSynced[18] = (pts & 0x000000FF);
++    }else if (payloadSynced[13] == 5){ // scte 35 splice insert type = 5
++        payloadSynced[21] = (pts & 0xFF000000) >> 24;
++        payloadSynced[22] = (pts & 0x00FF0000) >> 16;
++        payloadSynced[23] = (pts & 0x0000FF00) >> 8;
++        payloadSynced[24] = (pts & 0x000000FF);
++    }else{
++        av_log(s, AV_LOG_ERROR, "SCTE35 signal type not yet supported\n");
++    }
++    memcpy(q, payloadSynced, payload_size);
++    q+=payload_size;
++    mpegts_write_section_scte35(&ts->scte35, data, q - data);
++}
++
+ /* This stores a string in buf with the correct encoding and also sets the
+  * first byte as the length. !str is accepted for an empty string.
+  * If the string is already encoded, invalid UTF-8 or has no multibyte sequence
+@@ -1027,6 +1102,12 @@ static int mpegts_init(AVFormatContext *s)
+     if (!ts->pkt)
+         return AVERROR(ENOMEM);
+ 
++    // NETINT: add scte35 type to mpegts muxer as PSI
++    ts->scte35.cc           = 15;
++    ts->scte35.discontinuity= ts->flags & MPEGTS_FLAG_DISCONT;
++    ts->scte35.write_packet = section_write_packet;
++    ts->scte35.opaque       = s;
++
+     /* assign pids to each stream */
+     for (i = 0; i < s->nb_streams; i++) {
+         AVStream *st = s->streams[i];
+@@ -1144,6 +1225,7 @@ static int mpegts_init(AVFormatContext *s)
+ 
+     ts->last_pat_ts = AV_NOPTS_VALUE;
+     ts->last_sdt_ts = AV_NOPTS_VALUE;
++    ts->last_scte35_ts = AV_NOPTS_VALUE; // NETINT: add scte35 type to mpegts muxer as PSI
+     ts->pat_period = av_rescale(ts->pat_period_us, PCR_TIME_BASE, AV_TIME_BASE);
+     ts->sdt_period = av_rescale(ts->sdt_period_us, PCR_TIME_BASE, AV_TIME_BASE);
+ 
+@@ -1327,6 +1409,13 @@ static void mpegts_write_pes(AVFormatContext *s, AVStream *st,
+             pcr = (dts - delay) * 300;
+ 
+         retransmit_si_info(s, force_pat, force_sdt, pcr);
++        // NETINT: add scte35 type to mpegts muxer as PSI
++        if(st->codecpar->codec_id == AV_CODEC_ID_SCTE_35){
++          ts->scte35.pid = ts_st->pid;
++          mpegts_write_scte35 (s, pts, payload, payload_size);
++          payload_size = 0;
++          continue;
++        }
+         force_pat = 0;
+         force_sdt = 0;
+ 
+@@ -1692,12 +1781,13 @@ static int mpegts_write_packet_internal(AVFormatContext *s, AVPacket *pkt)
+     if (side_data)
+         stream_id = side_data[0];
+ 
+-    if (ts->copyts < 1) {
+-        if (!ts->first_dts_checked && dts != AV_NOPTS_VALUE) {
+-            ts->first_pcr += dts * 300;
+-            ts->first_dts_checked = 1;
+-        }
++    // NETINT: Fix for use of '-muxrate' with '-copyts' and '-mpegts_copyts'
++    if (!ts->first_dts_checked && dts != AV_NOPTS_VALUE) {
++        ts->first_pcr += dts * 300;
++        ts->first_dts_checked = 1;
++    }
+ 
++    if (ts->copyts < 1) {
+         if (pts != AV_NOPTS_VALUE)
+             pts += delay;
+         if (dts != AV_NOPTS_VALUE)
+diff --git a/libavformat/mux.c b/libavformat/mux.c
+index 6a557d2..8139bb5 100644
+--- a/libavformat/mux.c
++++ b/libavformat/mux.c
+@@ -934,6 +934,8 @@ int ff_interleave_packet_per_dts(AVFormatContext *s, AVPacket *out,
+ {
+     PacketList *pktl;
+     int stream_count = 0;
++    // NETINT: fix scte35 handling in muxing buffer
++    int scte35_count = 0; // scte35 stream count
+     int noninterleaved_count = 0;
+     int i, ret;
+     int eof = flush;
+@@ -944,8 +946,15 @@ int ff_interleave_packet_per_dts(AVFormatContext *s, AVPacket *out,
+     }
+ 
+     for (i = 0; i < s->nb_streams; i++) {
+-        if (s->streams[i]->internal->last_in_packet_buffer) {
++        // NETINT: fix scte35 handling in muxing buffer
++        // flush scte35 in muxing buffer like regular AV streams to fix ffmpeg muxing output
++        // stall when scte35 packet DTS has large delta compared to regular AV packet DTS
++        if (s->streams[i]->internal->last_in_packet_buffer || s->streams[i]->codecpar->codec_id == AV_CODEC_ID_SCTE_35) { // treat scte35 like regular AV stream for flush consideration
+             ++stream_count;
++            // NETINT: fix scte35 handling in muxing buffer
++            if (s->streams[i]->codecpar->codec_id == AV_CODEC_ID_SCTE_35) { // keep count of scte35 stream to avoid flushing when regular AV streams end
++                scte35_count++;
++            }
+         } else if (s->streams[i]->codecpar->codec_type != AVMEDIA_TYPE_ATTACHMENT &&
+                    s->streams[i]->codecpar->codec_id != AV_CODEC_ID_VP8 &&
+                    s->streams[i]->codecpar->codec_id != AV_CODEC_ID_VP9) {
+@@ -1027,7 +1036,9 @@ int ff_interleave_packet_per_dts(AVFormatContext *s, AVPacket *out,
+         }
+     }
+ 
+-    if (stream_count && flush) {
++    // NETINT: fix scte35 handling in muxing buffer
++    // the muxing buffer requires at least one regular AV stream be present during flush, otherwise segfault
++    if (((stream_count - scte35_count) > 0) && flush) { // flush if there are non-scte35 streams present AND it is required
+         AVStream *st;
+         pktl = s->internal->packet_buffer;
+         *out = pktl->pkt;
+diff --git a/libavformat/utils.c b/libavformat/utils.c
+index 1384b56..a2939c8 100644
+--- a/libavformat/utils.c
++++ b/libavformat/utils.c
+@@ -4558,7 +4558,7 @@ FF_ENABLE_DEPRECATION_WARNINGS
+ #endif
+ 
+         /* default pts setting is MPEG-like */
+-        avpriv_set_pts_info(st, 33, 1, 90000);
++        avpriv_set_pts_info(st, 62, 1, 90000);
+         /* we set the current DTS to 0 so that formats without any timestamps
+          * but durations get some timestamps, formats with some unknown
+          * timestamps have their first few packets buffered and the
+diff --git a/libavutil/Makefile b/libavutil/Makefile
+index 27bafe9..0f9af3e 100644
+--- a/libavutil/Makefile
++++ b/libavutil/Makefile
+@@ -40,6 +40,7 @@ HEADERS = adler32.h                                                     \
+           hwcontext_drm.h                                               \
+           hwcontext_dxva2.h                                             \
+           hwcontext_qsv.h                                               \
++          hwcontext_ni_logan.h                                          \
+           hwcontext_mediacodec.h                                        \
+           hwcontext_opencl.h                                            \
+           hwcontext_vaapi.h                                             \
+@@ -182,6 +183,7 @@ OBJS-$(CONFIG_LZO)                      += lzo.o
+ OBJS-$(CONFIG_MEDIACODEC)               += hwcontext_mediacodec.o
+ OBJS-$(CONFIG_OPENCL)                   += hwcontext_opencl.o
+ OBJS-$(CONFIG_QSV)                      += hwcontext_qsv.o
++OBJS-$(CONFIG_NI_LOGAN)                 += hwcontext_ni_logan.o
+ OBJS-$(CONFIG_VAAPI)                    += hwcontext_vaapi.o
+ OBJS-$(CONFIG_VIDEOTOOLBOX)             += hwcontext_videotoolbox.o
+ OBJS-$(CONFIG_VDPAU)                    += hwcontext_vdpau.o
+@@ -198,6 +200,7 @@ SKIPHEADERS-$(CONFIG_CUDA)             += hwcontext_cuda_internal.h     \
+ SKIPHEADERS-$(CONFIG_D3D11VA)          += hwcontext_d3d11va.h
+ SKIPHEADERS-$(CONFIG_DXVA2)            += hwcontext_dxva2.h
+ SKIPHEADERS-$(CONFIG_QSV)              += hwcontext_qsv.h
++SKIPHEADERS-$(CONFIG_NI_LOGAN)         += hwcontext_ni_logan.h
+ SKIPHEADERS-$(CONFIG_OPENCL)           += hwcontext_opencl.h
+ SKIPHEADERS-$(CONFIG_VAAPI)            += hwcontext_vaapi.h
+ SKIPHEADERS-$(CONFIG_VIDEOTOOLBOX)     += hwcontext_videotoolbox.h
+diff --git a/libavutil/frame.h b/libavutil/frame.h
+index 7d1f8e2..2b6449f 100644
+--- a/libavutil/frame.h
++++ b/libavutil/frame.h
+@@ -198,6 +198,35 @@ enum AVFrameSideDataType {
+      * Must be present for every frame which should have film grain applied.
+      */
+     AV_FRAME_DATA_FILM_GRAIN_PARAMS,
++
++    // NETINT: custom SEI data
++    /**
++     * This side data takes SEI payload type USER_DATA_UNREGISTERED.
++     * There will be no byte reordering.
++     * Usually this payload would be: 16B UUID + other payload Bytes.
++     */
++    AV_FRAME_DATA_NETINT_UDU_SEI,
++
++    // NETINT: custom SEI data
++    /**
++     * This side data takes SEI payload custom types.
++     * There will be no byte reordering.
++     * Usually this payload would be: 1B Custom SEI type + 16B UUID + other payload Bytes.
++     */
++    AV_FRAME_DATA_NETINT_CUSTOM_SEI,
++
++    // NETINT: custom bitrate adjustment
++    /**
++     * This side data takes int32_t type data as payload which indicates the new target bitrate value.
++     */
++    AV_FRAME_DATA_NETINT_BITRATE,
++
++    // NETINT: long term reference frame support
++    /**
++     * This side data is a struct of AVNetintLongTermRef that specifies a
++     * frame's support of long term reference frame.
++     */
++    AV_FRAME_DATA_NETINT_LONG_TERM_REF,
+ };
+ 
+ enum AVActiveFormatDescription {
+@@ -285,6 +314,20 @@ typedef struct AVRegionOfInterest {
+     AVRational qoffset;
+ } AVRegionOfInterest;
+ 
++/**
++ * NETINT: Structure describing long term reference frame support.
++ *
++ */
++typedef struct AVNetintLongTermRef {
++  // A flag for the current picture to be used as a long term reference
++  // picture later at other pictures' encoding
++  uint8_t use_cur_src_as_long_term_pic;
++
++  // A flag to use a long term reference picture in DPB when encoding the
++  // current picture
++  uint8_t use_long_term_ref;
++} AVNetintLongTermRef;
++
+ /**
+  * This structure describes decoded (raw) audio or video data.
+  *
+diff --git a/libavutil/hwcontext.c b/libavutil/hwcontext.c
+index d13d0f7..baf899e 100644
+--- a/libavutil/hwcontext.c
++++ b/libavutil/hwcontext.c
+@@ -50,6 +50,9 @@ static const HWContextType * const hw_table[] = {
+ #if CONFIG_VAAPI
+     &ff_hwcontext_type_vaapi,
+ #endif
++#if CONFIG_NI_LOGAN
++    &ff_hwcontext_type_ni_logan,
++#endif
+ #if CONFIG_VDPAU
+     &ff_hwcontext_type_vdpau,
+ #endif
+@@ -73,6 +76,7 @@ static const char *const hw_type_names[] = {
+     [AV_HWDEVICE_TYPE_OPENCL] = "opencl",
+     [AV_HWDEVICE_TYPE_QSV]    = "qsv",
+     [AV_HWDEVICE_TYPE_VAAPI]  = "vaapi",
++    [AV_HWDEVICE_TYPE_NI_LOGAN] = "ni_logan",
+     [AV_HWDEVICE_TYPE_VDPAU]  = "vdpau",
+     [AV_HWDEVICE_TYPE_VIDEOTOOLBOX] = "videotoolbox",
+     [AV_HWDEVICE_TYPE_MEDIACODEC] = "mediacodec",
+diff --git a/libavutil/hwcontext.h b/libavutil/hwcontext.h
+index 04d19d8..7cc81d2 100644
+--- a/libavutil/hwcontext.h
++++ b/libavutil/hwcontext.h
+@@ -31,6 +31,7 @@ enum AVHWDeviceType {
+     AV_HWDEVICE_TYPE_VAAPI,
+     AV_HWDEVICE_TYPE_DXVA2,
+     AV_HWDEVICE_TYPE_QSV,
++    AV_HWDEVICE_TYPE_NI_LOGAN,
+     AV_HWDEVICE_TYPE_VIDEOTOOLBOX,
+     AV_HWDEVICE_TYPE_D3D11VA,
+     AV_HWDEVICE_TYPE_DRM,
+diff --git a/libavutil/hwcontext_internal.h b/libavutil/hwcontext_internal.h
+index e626649..c0420ff 100644
+--- a/libavutil/hwcontext_internal.h
++++ b/libavutil/hwcontext_internal.h
+@@ -169,6 +169,7 @@ extern const HWContextType ff_hwcontext_type_drm;
+ extern const HWContextType ff_hwcontext_type_dxva2;
+ extern const HWContextType ff_hwcontext_type_opencl;
+ extern const HWContextType ff_hwcontext_type_qsv;
++extern const HWContextType ff_hwcontext_type_ni_logan;
+ extern const HWContextType ff_hwcontext_type_vaapi;
+ extern const HWContextType ff_hwcontext_type_vdpau;
+ extern const HWContextType ff_hwcontext_type_videotoolbox;
+diff --git a/libavutil/pixdesc.c b/libavutil/pixdesc.c
+index 18c7a0e..58010a6 100644
+--- a/libavutil/pixdesc.c
++++ b/libavutil/pixdesc.c
+@@ -2085,6 +2085,13 @@ static const AVPixFmtDescriptor av_pix_fmt_descriptors[AV_PIX_FMT_NB] = {
+         .name = "qsv",
+         .flags = AV_PIX_FMT_FLAG_HWACCEL,
+     },
++    /**
++     * NETINT: AV_PIX_FMT_NI_LOGAN pixel format for Logan HW frame.
++     */
++    [AV_PIX_FMT_NI_LOGAN] = {
++        .name = "ni_logan",
++        .flags = AV_PIX_FMT_FLAG_HWACCEL,
++    },
+     [AV_PIX_FMT_MEDIACODEC] = {
+         .name = "mediacodec",
+         .flags = AV_PIX_FMT_FLAG_HWACCEL,
+diff --git a/libavutil/pixfmt.h b/libavutil/pixfmt.h
+index 46ef211..5be9367 100644
+--- a/libavutil/pixfmt.h
++++ b/libavutil/pixfmt.h
+@@ -220,6 +220,11 @@ enum AVPixelFormat {
+      *  mfxFrameSurface1 structure.
+      */
+     AV_PIX_FMT_QSV,
++    /*
++     * NETINT: HW acceleration through NI, data[3] contains a pointer to the
++     * ni_logan_hwframe_surface_t structure, for Logan.
++    */
++    AV_PIX_FMT_NI_LOGAN,
+     /**
+      * HW acceleration though MMAL, data[3] contains a pointer to the
+      * MMAL_BUFFER_HEADER_T structure.
