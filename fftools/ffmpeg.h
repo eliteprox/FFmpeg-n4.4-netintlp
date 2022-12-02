@@ -61,6 +61,7 @@ enum HWAccelID {
     HWACCEL_GENERIC,
     HWACCEL_VIDEOTOOLBOX,
     HWACCEL_QSV,
+    HWACCEL_NI,
 };
 
 typedef struct HWAccel {
@@ -132,6 +133,9 @@ typedef struct OptionsContext {
     int        nb_hwaccel_output_formats;
     SpecifierOpt *autorotate;
     int        nb_autorotate;
+    // NETINT/FFmpeg-patch: add option for autoscale
+    SpecifierOpt *autoscale;
+    int        nb_autoscale;
 
     /* output options */
     StreamMap *stream_maps;
@@ -460,6 +464,12 @@ typedef struct OutputStream {
     AVRational mux_timebase;
     AVRational enc_timebase;
 
+    // NETINT: add option to display windowed average FPS
+    int64_t ni_prev_fps_measurement_time;
+    int ni_prev_frame_count;
+    float ni_prev_fps;
+
+    int                    nb_bitstream_filters;
     AVBSFContext            *bsf_ctx;
 
     AVCodecContext *enc_ctx;
@@ -480,6 +490,8 @@ typedef struct OutputStream {
     int top_field_first;
     int rotate_overridden;
     double rotate_override_value;
+    // NETINT/FFmpeg-patch: add option for autoscale
+    int autoscale;
 
     AVRational frame_aspect_ratio;
 
@@ -584,6 +596,11 @@ extern float audio_drift_threshold;
 extern float dts_delta_threshold;
 extern float dts_error_threshold;
 
+// NETINT: add option to display windowed average FPS
+// if ni_interval_fps>0 the windowed average FPS calulation mode is used
+// when ni_interval_fps>0, ni_interval_fps is the window size and update interval
+extern float ni_interval_fps;
+
 extern int audio_volume;
 extern int audio_sync_method;
 extern int video_sync_method;
@@ -653,6 +670,7 @@ int ffmpeg_parse_options(int argc, char **argv);
 
 int videotoolbox_init(AVCodecContext *s);
 int qsv_init(AVCodecContext *s);
+int ni_init(AVCodecContext *s);
 
 HWDevice *hw_device_get_by_name(const char *name);
 int hw_device_init_from_string(const char *arg, HWDevice **dev);

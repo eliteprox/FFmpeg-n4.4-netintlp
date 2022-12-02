@@ -62,6 +62,7 @@ static const char *opt_name_hwaccels[]                  = {"hwaccel", NULL};
 static const char *opt_name_hwaccel_devices[]           = {"hwaccel_device", NULL};
 static const char *opt_name_hwaccel_output_formats[]    = {"hwaccel_output_format", NULL};
 static const char *opt_name_autorotate[]                = {"autorotate", NULL};
+static const char *const opt_name_autoscale[]           = {"autoscale", NULL};
 static const char *opt_name_max_frames[]                = {"frames", "aframes", "vframes", "dframes", NULL};
 static const char *opt_name_bitstream_filters[]         = {"bsf", "absf", "vbsf", NULL};
 static const char *opt_name_codec_tags[]                = {"tag", "atag", "vtag", "stag", NULL};
@@ -137,6 +138,9 @@ const HWAccel hwaccels[] = {
 #if CONFIG_LIBMFX
     { "qsv",   qsv_init,   HWACCEL_QSV,   AV_PIX_FMT_QSV },
 #endif
+#if CONFIG_NI
+    { "ni", ni_init, HWACCEL_NI, AV_PIX_FMT_NI },
+#endif
     { 0 },
 };
 HWDevice *filter_hw_device;
@@ -147,6 +151,11 @@ char *sdp_filename;
 float audio_drift_threshold = 0.1;
 float dts_delta_threshold   = 10;
 float dts_error_threshold   = 3600*30;
+
+// NETINT: add option to display windowed average FPS
+// if ni_interval_fps>0 the windowed average FPS calulation mode is used
+// when ni_interval_fps>0, ni_interval_fps is the window size and update interval
+float ni_interval_fps = 0;
 
 int audio_volume      = 256;
 int audio_sync_method = 0;
@@ -858,7 +867,17 @@ static void add_input_streams(OptionsContext *o, AVFormatContext *ic)
 #endif
 
             // avformat_find_stream_info() doesn't set this for us anymore.
-            ist->dec_ctx->framerate = st->avg_frame_rate;
+
+            // NETINT: use bitstream framerate info when find_stream_info cannot estimate it
+            if ((st->avg_frame_rate.num != 0) && (st->avg_frame_rate.den != 0)){
+                ist->dec_ctx->framerate = st->avg_frame_rate;
+            }else if ((st->r_frame_rate.num != 0) && (st->r_frame_rate.den != 0)){
+                ist->dec_ctx->framerate = st->r_frame_rate;
+            }else{
+                av_log(NULL, AV_LOG_WARNING, "No framerate info found or probed -> using a default 30 fps\n");
+                ist->dec_ctx->framerate.num = 30;
+                ist->dec_ctx->framerate.den = 1;
+            }
 
             MATCH_PER_STREAM_OPT(frame_rates, str, framerate, ic, st);
             if (framerate && av_parse_video_rate(&ist->framerate,
@@ -1429,6 +1448,15 @@ static OutputStream *new_output_stream(OptionsContext *o, AVFormatContext *oc, e
         exit_program(1);
     output_streams[nb_output_streams - 1] = ost;
 
+    // NETINT/FFmpeg-patch: add option for autoscale
+    ost->autoscale = 1;
+    MATCH_PER_STREAM_OPT(autoscale, i, ost->autoscale, oc, st);
+
+    // NETINT: add option to display windowed average FPS
+    ost->ni_prev_fps_measurement_time = 0;
+    ost->ni_prev_frame_count = 0;
+    ost->ni_prev_fps = 0;
+
     ost->file_index = nb_output_files - 1;
     ost->index      = idx;
     ost->st         = st;
@@ -1555,7 +1583,8 @@ static OutputStream *new_output_stream(OptionsContext *o, AVFormatContext *oc, e
     MATCH_PER_STREAM_OPT(disposition, str, ost->disposition, oc, st);
     ost->disposition = av_strdup(ost->disposition);
 
-    ost->max_muxing_queue_size = 128;
+    // NETINT: change max_muxing_queue_size from 128 to 512 to alleviate muxing issues due to encoding latency
+    ost->max_muxing_queue_size = 512;
     MATCH_PER_STREAM_OPT(max_muxing_queue_size, i, ost->max_muxing_queue_size, oc, st);
     ost->max_muxing_queue_size *= sizeof(AVPacket);
 
@@ -3503,6 +3532,8 @@ const OptionDef options[] = {
         "timestamp discontinuity delta threshold", "threshold" },
     { "dts_error_threshold", HAS_ARG | OPT_FLOAT | OPT_EXPERT,       { &dts_error_threshold },
         "timestamp error delta threshold", "threshold" },
+    { "ni_interval_fps", HAS_ARG | OPT_FLOAT | OPT_EXPERT,           { &ni_interval_fps }, // NETINT: add option to display windowed average FPS
+        "window size and reporting interval for moving average processing FPS calculation", "number" },
     { "xerror",         OPT_BOOL | OPT_EXPERT,                       { &exit_on_error },
         "exit on error", "error" },
     { "abort_on",       HAS_ARG | OPT_EXPERT,                        { .func_arg = opt_abort_on },
@@ -3664,6 +3695,10 @@ const OptionDef options[] = {
     { "autorotate",       HAS_ARG | OPT_BOOL | OPT_SPEC |
                           OPT_EXPERT | OPT_INPUT,                                { .off = OFFSET(autorotate) },
         "automatically insert correct rotate filters" },
+    // NETINT/FFmpeg-patch: add option for autoscale
+    { "autoscale",        HAS_ARG | OPT_BOOL | OPT_SPEC |
+                          OPT_EXPERT | OPT_OUTPUT,                               { .off = OFFSET(autoscale) },
+        "automatically insert a scale filter at the end of the filter graph" },
 
     /* audio options */
     { "aframes",        OPT_AUDIO | HAS_ARG  | OPT_PERFILE | OPT_OUTPUT,           { .func_arg = opt_audio_frames },
