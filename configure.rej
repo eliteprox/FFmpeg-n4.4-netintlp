@@ -1,0 +1,9 @@
+diff a/configure b/configure	(rejected hunks)
+@@ -1869,6 +1868,7 @@ HWACCEL_LIBRARY_LIST="
+     omx
+     opencl
+     vulkan
++    libtensorflow
+ "
+ 
+ DOCUMENT_LIST="
